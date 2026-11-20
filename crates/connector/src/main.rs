@@ -2,6 +2,7 @@ mod exec;
 #[cfg(feature = "gui")]
 mod gui;
 mod ops;
+mod pin;
 mod redact;
 mod runtime;
 mod store;
@@ -27,6 +28,9 @@ enum Cmd {
     Run,
     /// Show or set hub settings.
     Hub {
+        /// Pairing code from `ccc-hub token new/pair` (sets URL, token, certificate).
+        #[arg(long)]
+        pair: Option<String>,
         /// Hub URL, e.g. wss://server.example.com/ccc
         #[arg(long)]
         url: Option<String>,
@@ -219,11 +223,18 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Cmd::Hub { url, token, token_stdin, name } => {
+        Cmd::Hub { pair, url, token, token_stdin, name } => {
+            if let Some(code) = pair {
+                let p = store::apply_pairing(&code)?;
+                println!("paired with {}{}", p.url, if p.cert.is_some() { " (pinned self-signed certificate)" } else { "" });
+            }
             let mut c = store::load()?;
             if let Some(u) = url {
                 if !(u.starts_with("ws://") || u.starts_with("wss://")) {
                     bail!("hub URL must start with wss:// (or ws:// for testing)");
+                }
+                if u != c.hub_url {
+                    c.hub_cert.clear();
                 }
                 c.hub_url = u;
             }
@@ -245,6 +256,9 @@ fn main() -> Result<()> {
             println!("name:  {}", c.name);
             println!("url:   {}", if c.hub_url.is_empty() { "(not set)" } else { &c.hub_url });
             println!("token: {}", if store::get_secret(store::HUB_TOKEN)?.is_some() { "saved" } else { "(not set)" });
+            if !c.hub_cert.is_empty() {
+                println!("cert:  {} (pinned)", c.hub_cert);
+            }
             println!("config: {}", store::config_path().display());
             Ok(())
         }

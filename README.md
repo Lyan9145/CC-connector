@@ -41,16 +41,26 @@ agent can grep it locally), and per-connection **init commands** (e.g. `source
 ```bash
 sudo install -m755 ccc-hub-linux-x86_64 /usr/local/bin/ccc-hub
 
-ccc-hub config --listen 127.0.0.1:8765      # behind a reverse proxy (recommended)
-# or built-in TLS:  ccc-hub config --listen 0.0.0.0:8765 --tls-cert cert.pem --tls-key key.pem
-
-ccc-hub token new laptop                    # prints a token once; paste it into the connector
+ccc-hub config --listen 0.0.0.0:22624 --public-url wss://your.server.com:22624
+ccc-hub tls self-signed                     # built-in TLS, no CA or domain validation needed
 
 ccc-hub print-systemd | sudo tee /etc/systemd/system/ccc-hub.service
 sudo systemctl daemon-reload && sudo systemctl enable --now ccc-hub
 
+ccc-hub token new laptop                    # prints a one-line pairing code (shown once)
+sudo systemctl restart ccc-hub              # tokens are loaded at start
+
 claude mcp add remote --scope user -- /usr/local/bin/ccc-hub mcp
 ```
+
+The **pairing code** (`ccc1:…`) bundles the hub URL, the token and the hub certificate's
+fingerprint. The connector pins that fingerprint, so a self-signed certificate is as safe as a
+CA-signed one, and a man-in-the-middle is rejected. `ccc-hub token pair <name>` issues a new code
+(and invalidates the old token after a restart).
+
+Using a real certificate instead (Let's Encrypt, or a reverse proxy) also works:
+`ccc-hub config --tls-cert fullchain.pem --tls-key privkey.pem`, or `ccc-hub tls off` behind a
+proxy. Then connectors verify against public CAs, and no pin is stored.
 
 Reverse proxy examples (WebSockets must be passed through):
 
@@ -74,14 +84,14 @@ location /ccc {
 }
 ```
 
-The connector URL is then `wss://your.server.com/ccc`. Plain `ws://` works but sends the token
-unencrypted, so use it only for testing or inside a VPN/SSH tunnel.
+Plain `ws://` (`ccc-hub tls off` without a proxy) works but sends the token and all traffic
+unencrypted; use it only for testing.
 
 ### 2. Laptop
 
 **Windows:** run `ccc-windows-x86_64.exe`. **Ubuntu:** `chmod +x ccc-linux-x86_64 && ./ccc-linux-x86_64`.
 
-1. **Hub** tab: enter the connector name, hub URL and token → *Save and connect*.
+1. **Hub** tab: paste the pairing code → **Pair**. (Or fill in URL and token manually.)
 2. **Connections** tab:
    * add *This computer* (e.g. name `laptop`) so the agent can work on the laptop itself;
    * add an *SSH host* for the robot (host/IP, user, password or key). Press **Test**: it
@@ -92,7 +102,7 @@ unencrypted, so use it only for testing or inside a VPN/SSH tunnel.
 The same can be done from the CLI (handy for a headless Ubuntu box):
 
 ```bash
-ccc hub --url wss://your.server.com/ccc --token --name laptop
+ccc hub --pair 'ccc1:…' --name laptop
 ccc add laptop --local --desc "my laptop"
 ccc add robot --host 192.168.1.50 --user ubuntu --password \
         --desc "UR5 arm, ROS 2 Humble" --init "source /opt/ros/humble/setup.bash" --cwd "~/ros_ws"
@@ -120,13 +130,15 @@ Other commands: `ccc edit NAME [--rename NEW] [--password] [--key FILE] [--disab
   commands like `ip addr` can still reveal network details, and `pull` copies files byte-for-byte.
 * **Host keys** are trusted on first use and pinned; a changed key refuses the connection
   until you *Forget* it.
-* **Hub auth:** each connector needs a token (`ccc-hub token new/list/revoke`); the hub stores
-  only its SHA-256.
+* **Hub auth:** each connector needs a token (`ccc-hub token new/pair/list/revoke`); the hub
+  stores only its SHA-256. With a self-signed hub certificate the connector pins its fingerprint
+  (from the pairing code) and refuses any other certificate.
 
 ## Limits
 
 * SSH targets must be Linux/POSIX (bash, coreutils). The laptop itself can be Windows or Linux.
 * On Windows, `sudo` isn't available; run `ccc` as Administrator if the agent needs admin rights.
+  Commands run in PowerShell 7 (`pwsh`) when installed, else Windows PowerShell 5.1.
 * Transfers are capped at 500 MB per call; `exec` timeout is at most 1 h (use `job` for longer).
 
 ## Building
@@ -135,6 +147,7 @@ Other commands: `ccc edit NAME [--rename NEW] [--password] [--key FILE] [--disab
 rustup target add x86_64-pc-windows-gnu
 sudo apt install mingw-w64 libdbus-1-dev pkg-config     # plus GUI deps: libxkbcommon-dev libgtk-3-dev
 scripts/build-release.sh                                # → dist/
+python3 scripts/make-icon.py <bold.ttf> crates/connector/assets   # regenerate the app icon (needs Pillow)
 ```
 
 Crates: `crates/proto` (wire protocol), `crates/hub` (`ccc-hub`), `crates/connector` (`ccc`).

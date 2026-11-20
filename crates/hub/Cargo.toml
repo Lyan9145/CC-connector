@@ -24,3 +24,5 @@ dirs.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+base64 = "0.22"

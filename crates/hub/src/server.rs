@@ -143,6 +143,9 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
     }
     let listener = TcpListener::bind(&cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?;
     eprintln!("listening on {} ({})", cfg.listen, if tls.is_some() { "wss" } else { "ws; put TLS in front of it" });
+    if let Ok(fp) = crate::config::cert_fingerprint(&cfg.tls_cert) {
+        eprintln!("certificate {fp}");
+    }
     loop {
         let (tcp, _) = listener.accept().await?;
         let _ = tcp.set_nodelay(true);

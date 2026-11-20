@@ -141,18 +141,29 @@ pub fn psq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Turn error/warning records into one short line each (instead of
+/// PowerShell's multi-line, localized error view) and stream as text.
+const PS_FMT: &str = "ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { 'ERROR: ' + $_.Exception.Message } \
+elseif ($_ -is [System.Management.Automation.WarningRecord]) { 'WARNING: ' + $_.Message } else { $_ } } | Out-String -Stream -Width 250";
+
+/// Body that runs `init` + `cmd` with merged, compact output; sets `$code`.
+fn ps_body(init: &str, cmd: &str) -> String {
+    format!(
+        "$global:LASTEXITCODE=0\n$code=0\ntry {{\n& {{\n{init}\n{cmd}\n}} *>&1 | {PS_FMT}\n\
+         if ($LASTEXITCODE) {{ $code=$LASTEXITCODE }}\n}} catch {{\n'ERROR: ' + $_.Exception.Message\n$code=1\n}}\n"
+    )
+}
+
+const PS_HEAD: &str = "$ProgressPreference='SilentlyContinue'\n$ErrorActionPreference='Continue'\n\
+    [Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n$OutputEncoding=[System.Text.Encoding]::UTF8\n";
+
 fn ps_exec_script(cmd: &str, cwd: Option<&str>, init: &str) -> String {
-    let mut s = String::from(
-        "$ProgressPreference='SilentlyContinue'\n$ErrorActionPreference='Continue'\n\
-         [Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n",
-    );
+    let mut s = String::from(PS_HEAD);
     if let Some(d) = cwd {
         s.push_str(&format!("Set-Location -LiteralPath {}\n", psq(&local::expand(d).to_string_lossy())));
     }
-    s.push_str(&format!(
-        "$global:LASTEXITCODE=0\n& {{\n{init}\n{cmd}\n}} *>&1 | Out-String -Stream -Width 250\n\
-         if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}\n"
-    ));
+    s.push_str(&ps_body(init, cmd));
+    s.push_str("exit $code\n");
     s
 }
 
@@ -439,19 +450,19 @@ kill -KILL -- -"$1" 2>/dev/null; kill -KILL "$1" 2>/dev/null; exit 0"#;
                     let cwd = ctx.default_cwd(cwd.clone()).map(|d| local::expand(&d)).unwrap_or_else(local::home);
                     let exitf = jdir.join(format!("{id}.exit"));
                     let inner = format!(
-                        "$ProgressPreference='SilentlyContinue'\n$global:LASTEXITCODE=0\n& {{\n{init}\n{cmd}\n}} *>&1 | Out-String -Stream -Width 250\n\
-                         $c = if ($LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }}\nSet-Content -LiteralPath {ef} -Value $c\n",
-                        init = ctx.conn.init,
+                        "{PS_HEAD}{body}Set-Content -LiteralPath {ef} -Value $code\n",
+                        body = ps_body(&ctx.conn.init, cmd),
                         ef = psq(&exitf.to_string_lossy())
                     );
                     format!(
                         "{p}New-Item -ItemType Directory -Force -Path $J | Out-Null\n\
                          Set-Content -LiteralPath (Join-Path $J '{id}.cmd') -Value {cmdq}\n\
-                         $proc = Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{enc}' \
+                         $proc = Start-Process {psexe} -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{enc}' \
                          -WorkingDirectory {cwdq} -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $J '{id}.log') -RedirectStandardError (Join-Path $J '{id}.err')\n\
                          Set-Content -LiteralPath (Join-Path $J '{id}.pid') -Value $proc.Id\nStart-Sleep 1\nst '{id}'\n'--- output:'\n\
                          Get-Content (Join-Path $J '{id}.log') -Tail 20 -ErrorAction SilentlyContinue\n",
                         cmdq = psq(cmd),
+                        psexe = psq(local::ps_exe()),
                         enc = local::ps_encode(&inner),
                         cwdq = psq(&cwd.to_string_lossy()),
                     )

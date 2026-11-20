@@ -135,29 +135,33 @@ impl SshTarget {
             ch.data(&data[..]).await?;
         }
         ch.eof().await?;
-        let display = r.display;
-        let collect = async {
-            let mut out = if display { display_buf() } else { CapBuf::new(DATA_MAX, 0) };
-            let mut err = CapBuf::new(256 << 10, 0);
-            let mut code = None;
-            while let Some(msg) = ch.wait().await {
-                match msg {
-                    ChannelMsg::Data { data } => out.push(&data),
-                    ChannelMsg::ExtendedData { data, .. } => err.push(&data),
-                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status as i32),
-                    ChannelMsg::ExitSignal { .. } => code = code.or(Some(-1)),
-                    _ => {}
+        let mut out = if r.display { display_buf() } else { CapBuf::new(DATA_MAX, 0) };
+        let mut err = CapBuf::new(256 << 10, 0);
+        let mut code = None;
+        let mut killed = false;
+        let deadline = tokio::time::sleep(r.timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                msg = ch.wait() => match msg {
+                    Some(ChannelMsg::Data { data }) => out.push(&data),
+                    Some(ChannelMsg::ExtendedData { data, .. }) => err.push(&data),
+                    Some(ChannelMsg::ExitStatus { exit_status }) => code = Some(exit_status as i32),
+                    Some(ChannelMsg::ExitSignal { .. }) => code = code.or(Some(-1)),
+                    Some(_) => {}
+                    None => break,
+                },
+                _ = &mut deadline => {
+                    // keep partial output; closing the channel hangs up the remote command
+                    killed = true;
+                    let _ = ch.close().await;
+                    code = None;
+                    break;
                 }
             }
-            (out, err, code)
-        };
-        match tokio::time::timeout(r.timeout, collect).await {
-            Ok((out, err, code)) => {
-                anyhow::ensure!(display || !out.overflowed(), "output exceeds {} MB", DATA_MAX >> 20);
-                Ok(RawOut { code, stdout: out.finish(), stderr: err.finish(), killed: false })
-            }
-            Err(_) => Ok(RawOut { code: None, killed: true, ..Default::default() }),
         }
+        anyhow::ensure!(r.display || !out.overflowed(), "output exceeds {} MB", DATA_MAX >> 20);
+        Ok(RawOut { code, stdout: out.finish(), stderr: err.finish(), killed })
     }
 
     /// Detect OS on the remote side.

@@ -20,6 +20,9 @@ pub struct HubConfig {
     pub tls_key: String,
     /// Unix socket for the MCP shim. Empty = default.
     pub socket: String,
+    /// URL connectors use to reach this hub, e.g. wss://example.com:22624
+    /// (used to build pairing codes).
+    pub public_url: String,
     #[serde(rename = "token")]
     pub tokens: Vec<Token>,
 }
@@ -31,6 +34,7 @@ impl Default for HubConfig {
             tls_cert: String::new(),
             tls_key: String::new(),
             socket: String::new(),
+            public_url: String::new(),
             tokens: vec![],
         }
     }
@@ -110,4 +114,39 @@ pub fn new_token() -> String {
     let mut b = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut b);
     format!("ccc_{}", hex::encode(b))
+}
+
+/// SHA-256 fingerprint ("SHA256:<hex>") of the first certificate in a PEM file.
+pub fn cert_fingerprint(pem_path: &str) -> Result<String> {
+    let mut rd = std::io::BufReader::new(std::fs::File::open(pem_path).with_context(|| format!("open {pem_path}"))?);
+    let der = rustls_pemfile::certs(&mut rd).next().context("no certificate in PEM")??;
+    Ok(format!("SHA256:{}", hex::encode(Sha256::digest(der.as_ref()))))
+}
+
+/// Generate a self-signed certificate for `names` into the hub dir and
+/// return (cert_path, key_path).
+pub fn self_signed(names: Vec<String>) -> Result<(String, String)> {
+    let ck = rcgen::generate_simple_self_signed(names).context("generate certificate")?;
+    let d = dir().join("tls");
+    std::fs::create_dir_all(&d)?;
+    let cert = d.join("cert.pem");
+    let key = d.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem())?;
+    std::fs::write(&key, ck.signing_key.serialize_pem())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok((cert.to_string_lossy().into(), key.to_string_lossy().into()))
+}
+
+/// One-line pairing code for a connector: url + token + pinned cert.
+pub fn pairing_code(url: &str, token: &str, fingerprint: Option<&str>) -> String {
+    use base64::Engine;
+    let mut v = serde_json::json!({ "u": url, "t": token });
+    if let Some(f) = fingerprint {
+        v["f"] = serde_json::Value::String(f.to_string());
+    }
+    format!("ccc1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string()))
 }

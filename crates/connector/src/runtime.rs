@@ -335,7 +335,13 @@ impl Runtime {
     async fn session(self: &Arc<Self>, url: &str, token: &str, reload_rx: &mut watch::Receiver<u64>) -> Result<()> {
         let mut req = url.into_client_request().context("invalid hub URL")?;
         req.headers_mut().insert("authorization", format!("Bearer {token}").parse()?);
-        let (ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(req))
+        let pin = self.cfg.read().unwrap().hub_cert.clone();
+        let connector = (url.starts_with("wss://") && !pin.is_empty())
+            .then(|| tokio_tungstenite::Connector::Rustls(crate::pin::client_config(&pin)));
+        let (ws, _) = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector),
+        )
             .await
             .map_err(|_| anyhow::anyhow!("connect timed out"))?
             .map_err(|e| match e {
@@ -347,8 +353,10 @@ impl Runtime {
         sink.send(Message::Binary(proto::encode(&Up::Hello { name, version: proto::VERSION.into() }).into())).await?;
         sink.send(Message::Binary(proto::encode(&Up::Machines(self.machines())).into())).await?;
         let plain = url.starts_with("ws://");
-        *self.hub_status.lock().unwrap() = if plain { "connected (unencrypted ws://)".into() } else { "connected".into() };
-        self.push_log(format!("hub: connected{}", if plain { " (unencrypted ws://)" } else { "" }));
+        let pinned = !plain && !pin.is_empty();
+        let how = if plain { " (unencrypted ws://)" } else if pinned { " (TLS, pinned certificate)" } else { " (TLS)" };
+        *self.hub_status.lock().unwrap() = format!("connected{how}");
+        self.push_log(format!("hub: connected{how}"));
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Up>();
         let mut changed_rx = self.changed.subscribe();
@@ -358,6 +366,7 @@ impl Runtime {
         let mut last_rx = tokio::time::Instant::now();
         let start_url = url.to_string();
         let start_token = token.to_string();
+        let start_pin = pin.clone();
         loop {
             tokio::select! {
                 m = stream.next() => {
@@ -389,7 +398,8 @@ impl Runtime {
                 Ok(()) = reload_rx.changed() => {
                     let url_now = self.cfg.read().unwrap().hub_url.clone();
                     let tok_now = self.hub_token.read().unwrap().clone();
-                    if url_now != start_url || tok_now.as_deref() != Some(start_token.as_str()) {
+                    let pin_now = self.cfg.read().unwrap().hub_cert.clone();
+                    if url_now != start_url || tok_now.as_deref() != Some(start_token.as_str()) || pin_now != start_pin {
                         let _ = sink.close().await;
                         self.push_log("hub: settings changed, reconnecting".into());
                         return Ok(());

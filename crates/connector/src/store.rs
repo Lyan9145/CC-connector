@@ -81,6 +81,9 @@ pub struct Config {
     pub name: String,
     /// e.g. wss://server.example.com/ccc
     pub hub_url: String,
+    /// Pinned hub certificate ("SHA256:<hex>") for self-signed hubs; empty =
+    /// verify against public CAs.
+    pub hub_cert: String,
     pub paused: bool,
     #[serde(rename = "connection")]
     pub connections: Vec<Connection>,
@@ -250,4 +253,34 @@ pub fn rename_secrets(old: &str, new: &str) -> Result<()> {
 pub fn delete_conn_secrets(name: &str) -> Result<()> {
     del_secret(&pw_key(name))?;
     del_secret(&pp_key(name))
+}
+
+/// Decoded pairing code from `ccc-hub token new/pair`.
+pub struct Pairing {
+    pub url: String,
+    pub token: String,
+    pub cert: Option<String>,
+}
+
+pub fn parse_pairing(code: &str) -> Result<Pairing> {
+    use base64::Engine;
+    let body = code.trim().strip_prefix("ccc1:").context("not a pairing code (should start with ccc1:)")?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body.trim_end_matches('='))
+        .context("pairing code is damaged (copy the whole line)")?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).context("pairing code is damaged")?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+    let (Some(url), Some(token)) = (s("u"), s("t")) else { bail!("pairing code is missing the URL or token") };
+    Ok(Pairing { url, token, cert: s("f") })
+}
+
+/// Save a pairing (URL, pinned cert, token) to config + keyring.
+pub fn apply_pairing(code: &str) -> Result<Pairing> {
+    let p = parse_pairing(code)?;
+    let mut c = load()?;
+    c.hub_url = p.url.clone();
+    c.hub_cert = p.cert.clone().unwrap_or_default();
+    set_secret(HUB_TOKEN, &p.token)?;
+    save(&c)?;
+    Ok(p)
 }
