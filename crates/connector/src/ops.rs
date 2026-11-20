@@ -148,9 +148,12 @@ elseif ($_ -is [System.Management.Automation.WarningRecord]) { 'WARNING: ' + $_.
 
 /// Body that runs `init` + `cmd` with merged, compact output; sets `$code`.
 fn ps_body(init: &str, cmd: &str) -> String {
+    // Compile the user's code at run time so syntax errors are caught and
+    // reported as one line, like any other error.
+    let code = psq(&format!("{init}\n{cmd}"));
     format!(
-        "$global:LASTEXITCODE=0\n$code=0\ntry {{\n& {{\n{init}\n{cmd}\n}} *>&1 | {PS_FMT}\n\
-         if ($LASTEXITCODE) {{ $code=$LASTEXITCODE }}\n}} catch {{\n'ERROR: ' + $_.Exception.Message\n$code=1\n}}\n"
+        "$global:LASTEXITCODE=0\n$code=0\ntry {{\n& ([ScriptBlock]::Create({code})) *>&1 | {PS_FMT}\n\
+         if ($LASTEXITCODE) {{ $code=$LASTEXITCODE }}\n}} catch {{\n'ERROR: ' + ($_.Exception.Message -replace '\\s*\\r?\\n\\s*', ' ')\n$code=1\n}}\n"
     )
 }
 
@@ -331,6 +334,42 @@ fn walk(root: &std::path::Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// PowerShell script that starts a detached Windows job.
+fn win_job_start(p: &str, id: &str, cmd: &str, cwd: &std::path::Path, init: &str, jdir: &std::path::Path) -> String {
+    let f = |ext: &str| jdir.join(format!("{id}.{ext}")).to_string_lossy().to_string();
+    // The job script itself, and a hidden wrapper that runs it,
+    // waits, and records its real exit code (also for `exit N`).
+    let job = ps_exec_script(cmd, None, init);
+    let wrapper = format!(
+        "$p = Start-Process {psexe} -ArgumentList '-NoProfile','-NonInteractive','-OutputFormat','Text','-ExecutionPolicy','Bypass','-File',{jobq} \
+         -WorkingDirectory {cwdq} -NoNewWindow -Wait -PassThru -RedirectStandardOutput {logq} -RedirectStandardError {errq}\n\
+         Set-Content -LiteralPath {exitq} -Value $p.ExitCode\n",
+        psexe = psq(local::ps_exe()),
+        jobq = psq(&format!("\"{}\"", f("ps1"))),
+        cwdq = psq(&cwd.to_string_lossy()),
+        logq = psq(&f("log")),
+        errq = psq(&f("err")),
+        exitq = psq(&f("exit")),
+    );
+    format!(
+        "{p}New-Item -ItemType Directory -Force -Path $J | Out-Null\n\
+         $bom = New-Object System.Text.UTF8Encoding $true\n\
+         [IO.File]::WriteAllText({jobf}, {jobs}, $bom)\n\
+         [IO.File]::WriteAllText({runf}, {runs}, $bom)\n\
+         Set-Content -LiteralPath (Join-Path $J '{id}.cmd') -Value {cmdq}\n\
+         $proc = Start-Process {psexe} -ArgumentList '-NoProfile','-NonInteractive','-OutputFormat','Text','-ExecutionPolicy','Bypass','-File',{runq} -WindowStyle Hidden -PassThru\n\
+         Set-Content -LiteralPath (Join-Path $J '{id}.pid') -Value $proc.Id\nStart-Sleep 1\nst '{id}'\n'--- output:'\n\
+         Get-Content (Join-Path $J '{id}.log') -Tail 20 -ErrorAction SilentlyContinue\n",
+        jobf = psq(&f("ps1")),
+        jobs = psq(&job),
+        runf = psq(&f("run.ps1")),
+        runs = psq(&wrapper),
+        runq = psq(&format!("\"{}\"", f("run.ps1"))),
+        cmdq = psq(cmd),
+        psexe = psq(local::ps_exe()),
+    )
+}
+
 // ------------------------------------------------------------------ jobs
 
 fn valid_id(id: &str) -> Result<()> {
@@ -448,24 +487,7 @@ kill -KILL -- -"$1" 2>/dev/null; kill -KILL "$1" 2>/dev/null; exit 0"#;
                     ctx.sudo(*sudo)?;
                     let id = new_id();
                     let cwd = ctx.default_cwd(cwd.clone()).map(|d| local::expand(&d)).unwrap_or_else(local::home);
-                    let exitf = jdir.join(format!("{id}.exit"));
-                    let inner = format!(
-                        "{PS_HEAD}{body}Set-Content -LiteralPath {ef} -Value $code\n",
-                        body = ps_body(&ctx.conn.init, cmd),
-                        ef = psq(&exitf.to_string_lossy())
-                    );
-                    format!(
-                        "{p}New-Item -ItemType Directory -Force -Path $J | Out-Null\n\
-                         Set-Content -LiteralPath (Join-Path $J '{id}.cmd') -Value {cmdq}\n\
-                         $proc = Start-Process {psexe} -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','{enc}' \
-                         -WorkingDirectory {cwdq} -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $J '{id}.log') -RedirectStandardError (Join-Path $J '{id}.err')\n\
-                         Set-Content -LiteralPath (Join-Path $J '{id}.pid') -Value $proc.Id\nStart-Sleep 1\nst '{id}'\n'--- output:'\n\
-                         Get-Content (Join-Path $J '{id}.log') -Tail 20 -ErrorAction SilentlyContinue\n",
-                        cmdq = psq(cmd),
-                        psexe = psq(local::ps_exe()),
-                        enc = local::ps_encode(&inner),
-                        cwdq = psq(&cwd.to_string_lossy()),
-                    )
+                    win_job_start(&p, &id, cmd, &cwd, &ctx.conn.init, &jdir)
                 }
                 JobOp::Status { id } => {
                     valid_id(id)?;
@@ -504,4 +526,18 @@ kill -KILL -- -"$1" 2>/dev/null; kill -KILL "$1" 2>/dev/null; exit 0"#;
         }
     }
     Ok(out.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore]
+    fn print_win_job_script() {
+        let p = format!("$J = {}\n{}", super::psq(r"C:\Users\BEN91\.ccc\jobs"), super::PS_PRELUDE);
+        let s = super::win_job_start(&p, "jtest1", "\"hello\"; exit 3", std::path::Path::new(r"C:\Users\BEN91"), "", std::path::Path::new(r"C:\Users\BEN91\.ccc\jobs"));
+        std::fs::write("/tmp/win_job.ps1", s).unwrap();
+        for (i, c) in ["if ( { broken", "\"before\"; exit 4", "Get-Date -Format yyyy; Write-Warning w"].iter().enumerate() {
+            std::fs::write(format!("/tmp/win_exec{i}.ps1"), super::ps_exec_script(c, Some(r"C:\Users\BEN91"), "")).unwrap();
+        }
+    }
 }

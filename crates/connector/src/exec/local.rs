@@ -95,7 +95,7 @@ fn command(script: &str) -> Command {
     let mut c;
     if cfg!(windows) {
         c = Command::new(ps_exe());
-        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &ps_encode(script)]);
+        c.args(["-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &ps_encode(script)]);
         #[cfg(windows)]
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     } else {
