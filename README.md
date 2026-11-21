@@ -22,10 +22,24 @@ without ever showing the agent an IP address, user name or password.
 The agent only sees each machine's **name, OS, status, access rules and your notes**. You decide,
 per machine and per tool, what it may do: allow, ask you first, or deny.
 
+**Download:** [latest release](https://github.com/Lyan9145/CC-connector/releases/latest)
+(Windows and Linux connector, Linux hub).
+
+## Screenshots
+
+| Your machines, with a status dot and a show/hide switch for each | Approving a write to a folder you set to *ask* |
+|---|---|
+| ![Connections tab](docs/screenshots/connections.png) | ![Approval pop-up](docs/screenshots/approval.png) |
+| **Activity:** what the agent did, per machine and per tool | **Hub:** pairing, with the getting-started guide |
+| ![Activity tab](docs/screenshots/activity-light.png) | ![Hub tab](docs/screenshots/hub-light.png) |
+
+The screenshots use sample data. The window follows the system light or dark theme.
+
 ---
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Quick start](#quick-start)
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub)
@@ -46,7 +60,7 @@ per machine and per tool, what it may do: allow, ask you first, or deny.
 
 You need: a Linux server running Claude Code that your laptop can reach on one TCP port, and
 the release files `ccc-hub-linux-x86_64` (server) and `ccc-windows-x86_64.exe` or
-`ccc-linux-x86_64` (laptop).
+`ccc-linux-x86_64` (laptop) from the [Releases page](https://github.com/Lyan9145/CC-connector/releases/latest).
 
 ### On the server (as root)
 
@@ -328,6 +342,8 @@ Required fields are marked with a red `*` (Name; for SSH also Host, Port, User, 
 or key file). If something is missing or invalid, Save says what, outlines those fields in red,
 and scrolls to the first one; the outline clears as soon as the field is fixed.
 
+![A connection's form: login, notes for the agent, permissions and folders](docs/screenshots/connection-form.png)
+
 | Field | Meaning |
 |---|---|
 | Name | What the agent calls the machine (`laptop`, `robot`, `wsl`). Letters, digits, `-` `_` `.`; max 40. |
@@ -473,6 +489,8 @@ filters a command would trigger. Alerts are listed under the filters.
 
 Filters are a safety net, not a sandbox: a determined agent can disguise a command (variables,
 encodings, scripts). Real limits come from the tool permissions and folder rules.
+
+![Security tab with the built-in filters and recent alerts](docs/screenshots/security.png)
 
 #### Typical setups
 
@@ -736,6 +754,7 @@ rustup target add x86_64-pc-windows-gnu
 sudo apt install mingw-w64 libdbus-1-dev pkg-config libxkbcommon-dev libgtk-3-dev
 scripts/build-release.sh                                  # → dist/ (Linux hub + connector, Windows connector)
 python3 scripts/make-icon.py <bold-font.ttf> crates/connector/assets   # regenerate the icon (needs Pillow)
+CCC_RENDER_DIR=$PWD/docs/screenshots cargo test -p ccc --release render_readme -- --ignored   # README screenshots
 cargo test
 ```
 
