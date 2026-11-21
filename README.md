@@ -42,7 +42,7 @@ The screenshots use sample data. The window follows the system light or dark the
 - [Screenshots](#screenshots)
 - [Quick start](#quick-start)
 - [Full guide](#full-guide)
-  - [1. Server: the hub](#1-server-the-hub)
+  - [1. Server: the hub](#1-server-the-hub) ([sharing the hub between users](#sharing-the-hub-between-users))
   - [2. Laptop: the connector](#2-laptop-the-connector) ([proxy](#proxy), [network adapter](#network-adapter), [clear data](#clear-data))
   - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
@@ -195,6 +195,67 @@ claude mcp list                                                      # should sh
 
 Use `--scope project` instead to enable it for one project only. New Claude Code sessions pick
 up the tools; already-running sessions do not.
+
+#### Sharing the hub between users
+
+One hub can serve several people who log in to the server as **different OS users**. Each
+user's agent sees only the machines whose token lists that user, and users can pair their own
+laptops without the admin.
+
+```bash
+# as root (the hub's admin)
+ccc-hub config --multi-user on
+systemctl restart ccc-hub        # the socket moves to /run/ccc-hub/hub.sock, open to all local users
+```
+
+Then each user, logged in as themselves:
+
+```bash
+ccc-hub token new laptop                                      # token "alice:laptop", owned by alice
+claude mcp add remote --scope user -- /usr/local/bin/ccc-hub mcp
+```
+
+The hub identifies each caller by the OS user on the other end of the socket (the kernel
+reports it, so it can't be faked). Who sees what:
+
+| Token | Whose agents see its machines |
+|---|---|
+| made by a user (`alice:laptop`) | its owners: the creator, plus anyone it is shared with |
+| made by the admin without `--owner` | the admin only |
+| made by the admin with `--owner bob --owner @lab` | bob and members of group `lab` (plus the admin while root all access is on) |
+
+The **admin** is root and the user the hub runs as. With `--root-all-access on` (the default)
+the admin's agents see every machine. With `off` they see only tokens without owners and those
+that list them; the admin can still list, revoke and re-pair every token.
+
+Sharing:
+
+```bash
+ccc-hub token new robot --owner @lab      # owners: you and members of the Unix group "lab"
+ccc-hub token share laptop bob @lab       # add owners
+ccc-hub token unshare laptop bob          # remove owners (applies to the next request)
+ccc-hub token list                        # tokens you may use or manage, online / offline
+```
+
+Rules for users who aren't the admin:
+
+- Their token names get their user name as a prefix (`alice:laptop`). They may leave the prefix
+  out in `pair`, `revoke`, `share` and `unshare`.
+- They can pair, revoke and share only the tokens **they created**. Being an owner of someone
+  else's token lets them use its machines, not manage it.
+- Self-service can be turned off (`ccc-hub config --self-service off`), and is capped per user
+  (`--max-tokens-per-user N`, default 20).
+
+What stays private between users: machine lists (names that clash are told apart only within a
+user's own view), "for this session" grants (session ids are tied to the OS user), and pairing
+codes (returned only to whoever asked). On the laptop, approval prompts show who is asking, e.g.
+`alice: /home/alice/proj (agent, started 14:02)`.
+
+People who share one OS account (e.g. everyone logs in as root) can't be kept apart: they can
+read each other's files and processes anyway. Give each person their own account.
+
+A hub not running as root can't create `/run/ccc-hub`; set a socket path it can write in
+`hub.toml` (`socket = "/srv/ccc/hub.sock"`) and give users `CCC_HUB_SOCK=/srv/ccc/hub.sock`.
 
 ---
 
@@ -630,6 +691,10 @@ process tree.
 - **Encrypted, authenticated link.** The laptop dials out to the hub; no port needs to be open on
   the laptop or the robot. With a self-signed hub certificate the connector accepts only the
   pinned certificate from the pairing code. Each connector has its own revocable token.
+- **Users on a shared hub are kept apart.** With `multi-user` on, each OS user's agent sees and
+  reaches only the machines whose token lists them, identified by the socket's peer credentials;
+  session grants can't be reused across users, and a connector can answer only the requests sent
+  to it (see [Sharing the hub between users](#sharing-the-hub-between-users)).
 - **SSH host keys** are trusted on first use and pinned; a changed key is refused until you
   *Forget* it.
 - **Permissions are enforced on the laptop.** Each request carries the tool it belongs to, and
@@ -657,8 +722,10 @@ process tree.
 | `ccc-hub serve [--listen ADDR]` | run the hub (normally via systemd) |
 | `ccc-hub mcp` | MCP server for Claude Code (started by Claude Code) |
 | `ccc-hub config [--listen ADDR] [--public-url URL] [--tls-cert F --tls-key F]` | show or change settings |
+| `ccc-hub config [--multi-user on\|off] [--root-all-access on\|off] [--self-service on\|off] [--max-tokens-per-user N]` | [sharing the hub between users](#sharing-the-hub-between-users) |
 | `ccc-hub tls self-signed [NAMES…]` · `tls show` · `tls off` | built-in TLS |
-| `ccc-hub token new NAME` · `token pair NAME` · `token list` · `token revoke NAME` | connector tokens and pairing codes |
+| `ccc-hub token new NAME [--owner USER\|@GROUP]…` · `token pair NAME` · `token list` · `token revoke NAME` | connector tokens and pairing codes (any local user on a multi-user hub) |
+| `ccc-hub token share NAME USER\|@GROUP…` · `token unshare NAME USER\|@GROUP…` | let others use a token's machines |
 | `ccc-hub call TOOL 'JSON'` | call a tool directly, e.g. `ccc-hub call exec '{"machine":"robot","cmd":"uptime"}'` |
 | `ccc-hub print-systemd` | print a systemd unit |
 
@@ -704,7 +771,7 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 | What | Where |
 |---|---|
 | Hub settings, tokens (hashed), TLS certificate | `~/.config/ccc-hub/` (`hub.toml`, `tls/`) |
-| Hub socket for the MCP shim | `~/.config/ccc-hub/hub.sock` |
+| Hub socket for the MCP shim | `~/.config/ccc-hub/hub.sock`; `/run/ccc-hub/hub.sock` with multi-user on |
 | Saved long outputs | `/tmp/ccc-out/` on the server |
 | Connector settings (no secrets) | Windows `%APPDATA%\ccc\config.toml`, Linux `~/.config/ccc/config.toml` |
 | Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `proxy-password`, `conn/<name>/password`, `conn/<name>/passphrase`) |
@@ -744,6 +811,7 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 | "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.4.x). Update the older one. |
 | "OS keyring unavailable" on Linux | Start a desktop session / gnome-keyring, or set `CCC_SECRETS=file`. |
 | Claude Code doesn't show the `remote` tools | Start a new session; check `claude mcp list`. |
+| On a shared hub, `machines` lists nothing / "unknown machine" | That machine's token doesn't list you: its creator runs `ccc-hub token share NAME <you>`. `ccc-hub token list` shows what you may use. |
 
 ---
 
