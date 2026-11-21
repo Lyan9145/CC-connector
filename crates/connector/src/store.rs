@@ -402,6 +402,38 @@ impl Default for Security {
     }
 }
 
+/// How the connector reaches the hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    /// Connect directly.
+    #[default]
+    Off,
+    /// Use the operating system's proxy (Windows Internet settings, or the
+    /// HTTPS_PROXY / ALL_PROXY environment variables).
+    System,
+    /// Use `url`.
+    Manual,
+}
+
+/// Proxy for the hub connection. The password (if any) is in the keyring
+/// under [`PROXY_PW`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProxyCfg {
+    pub mode: ProxyMode,
+    /// e.g. http://127.0.0.1:7890 or socks5://proxy.lan:1080
+    pub url: String,
+    /// User name for proxies that need a login (empty = none).
+    pub user: String,
+}
+
+impl ProxyCfg {
+    pub fn is_off(&self) -> bool {
+        self.mode == ProxyMode::Off && self.url.is_empty() && self.user.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -413,6 +445,8 @@ pub struct Config {
     /// verify against public CAs.
     pub hub_cert: String,
     pub paused: bool,
+    #[serde(skip_serializing_if = "ProxyCfg::is_off")]
+    pub proxy: ProxyCfg,
     #[serde(rename = "connection")]
     pub connections: Vec<Connection>,
     pub security: Security,
@@ -486,6 +520,7 @@ pub fn hostname() -> String {
 
 const SERVICE: &str = "cc-connector";
 pub const HUB_TOKEN: &str = "hub-token";
+pub const PROXY_PW: &str = "proxy-password";
 
 pub fn pw_key(conn: &str) -> String {
     format!("conn/{conn}/password")
@@ -587,6 +622,42 @@ pub fn rename_secrets(old: &str, new: &str) -> Result<()> {
 pub fn delete_conn_secrets(name: &str) -> Result<()> {
     del_secret(&pw_key(name))?;
     del_secret(&pp_key(name))
+}
+
+/// What "Clear data" removes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClearWhat {
+    /// connections, their saved passwords and trusted host keys
+    pub connections: bool,
+    /// hub URL, token, pinned certificate, proxy and connector name
+    pub hub: bool,
+    /// security filter settings
+    pub security: bool,
+}
+
+/// Remove saved settings and secrets (statistics and logs are the
+/// runtime's: see `Runtime::clear_activity`).
+pub fn clear_data(w: ClearWhat) -> Result<()> {
+    let mut c = load()?;
+    if w.connections {
+        for x in &c.connections {
+            delete_conn_secrets(&x.name)?;
+        }
+        c.connections.clear();
+    }
+    if w.hub {
+        del_secret(HUB_TOKEN)?;
+        del_secret(PROXY_PW)?;
+        c.hub_url.clear();
+        c.hub_cert.clear();
+        c.proxy = ProxyCfg::default();
+        c.name = hostname();
+        c.paused = false;
+    }
+    if w.security {
+        c.security = Security::default();
+    }
+    save(&c)
 }
 
 /// Decoded pairing code from `ccc-hub token new/pair`.

@@ -29,7 +29,7 @@ per machine and per tool, what it may do: allow, ask you first, or deny.
 - [Quick start](#quick-start)
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub)
-  - [2. Laptop: the connector](#2-laptop-the-connector)
+  - [2. Laptop: the connector](#2-laptop-the-connector) ([proxy](#proxy), [clear data](#clear-data))
   - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
 - [Agent tools reference](#agent-tools-reference)
@@ -211,6 +211,38 @@ The badge in the top-left corner shows the state:
 *Manual settings* (connector name, URL, token) are there if you prefer not to use a pairing
 code. The connector name is how this laptop is labelled on the hub (default: the computer name).
 
+On a fresh install the Hub page and the empty Connections page show **Getting started**, a
+three-step checklist (pair with the hub, add your machines, register the MCP server in Claude
+Code) that ticks itself off as you go and disappears when all three are done.
+
+#### Proxy
+
+If the laptop reaches the internet through a proxy, open the folded **Proxy** section on the Hub
+page:
+
+- **Off:** connect directly (default).
+- **Use system proxy:** Windows proxy settings (*Settings → Network → Proxy*, which is what Clash,
+  v2rayN and browsers use), or `HTTPS_PROXY` / `ALL_PROXY` on Linux. The bypass list
+  (`ProxyOverride` / `NO_PROXY`) is honoured. Auto-config (PAC) scripts are not supported: enter
+  the proxy manually instead.
+- **Manual:** `http://host:port` (HTTP CONNECT) or `socks5://host:port`; a bare `host:port`
+  means HTTP. Optional user name and password (the password goes to the OS keyring).
+
+Only the hub connection uses the proxy; SSH connections to your machines go directly from the
+laptop. The proxy sees the hub's host name and port, never the token or any traffic (TLS and the
+certificate pin are end to end). When connected, the Hub status says e.g.
+`connected (TLS, pinned certificate, via HTTP proxy 127.0.0.1:7890)`.
+CLI: `ccc hub --proxy socks5://127.0.0.1:1080`, `--proxy system`, `--proxy off`,
+`--proxy-user NAME` (prompts for the password).
+
+#### Clear data
+
+**Hub** page → **Clear data** (folded, at the bottom) → **Clear data…** opens a confirmation
+where you tick what to remove: connections with their saved passwords and host keys; the hub
+pairing, token and proxy; security filter settings; statistics, request log and alerts. Nothing
+on your machines or on the hub is touched. Use it to start over, or before handing the computer
+on.
+
 #### The window
 
 - **Connections:** your machines. The dot shows each one's status (green online, amber
@@ -224,7 +256,10 @@ code. The connector name is how this laptop is labelled on the hub (default: the
   are pending.
 - **Closing the window** while tool calls are running (or waiting for your approval) asks first:
   closing stops the connector, so those calls fail. Background jobs keep running either way.
-- **Hub:** pairing and hub status.
+- **Hub:** pairing, proxy, hub status, and *Clear data*.
+- **Unsaved changes:** leaving the connection form, the Hub settings or the Security tab with
+  unsaved edits (switching tabs, picking another connection, closing the window) asks
+  **Save / Discard changes / Cancel**.
 - **Activity:** what is running right now, analytics of what the agent did, and the request log
   (see below).
 - **Sessions:** each Claude Code session that used the connector, with what you allowed it "for
@@ -269,6 +304,9 @@ with generated sample data, to look at the page before you have history.
 ### 3. Adding machines
 
 **Connections → + Add connection**, fill in the form, then **Save** or **Save and test**.
+Required fields are marked with a red `*` (Name; for SSH also Host, Port, User, and the password
+or key file). If something is missing or invalid, Save says what, outlines those fields in red,
+and scrolls to the first one; the outline clears as soon as the field is fixed.
 
 | Field | Meaning |
 |---|---|
@@ -581,7 +619,7 @@ process tree.
 |---|---|
 | `ccc` | open the GUI |
 | `ccc run` | run without GUI |
-| `ccc hub [--pair CODE] [--url URL] [--token] [--name NAME]` | pair / show hub settings |
+| `ccc hub [--pair CODE] [--url URL] [--token] [--name NAME] [--proxy URL\|system\|off] [--proxy-user NAME]` | pair / show hub settings |
 | `ccc add NAME (--local \| --host H --user U) [options]` | add a connection |
 | `ccc edit NAME [--rename NEW] [options]` | change a connection |
 | `ccc rm NAME` · `ccc list` · `ccc test NAME` | remove / list / test |
@@ -618,7 +656,7 @@ Folder options: `--folder LEVEL=PATH` (repeatable; levels `full`, `read-ask`, `r
 | Hub socket for the MCP shim | `~/.config/ccc-hub/hub.sock` |
 | Saved long outputs | `/tmp/ccc-out/` on the server |
 | Connector settings (no secrets) | Windows `%APPDATA%\ccc\config.toml`, Linux `~/.config/ccc/config.toml` |
-| Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `conn/<name>/password`, `conn/<name>/passphrase`) |
+| Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `proxy-password`, `conn/<name>/password`, `conn/<name>/passphrase`) |
 | Connector statistics | `stats.json` next to the connector config |
 | Background jobs | `~/.ccc/jobs/` on each target machine |
 
@@ -637,6 +675,8 @@ Folder options: `--folder LEVEL=PATH` (repeatable; levels `full`, `read-ask`, `r
 | Badge **OFFLINE**, "Connection refused" or "connect timed out" | Hub not running (`systemctl status ccc-hub`), or the port is blocked by a firewall / cloud security group. |
 | "hub rejected token (401)" | Token revoked or replaced. Issue a new code with `ccc-hub token pair NAME` and pair again (no hub restart needed). |
 | "hub certificate … does not match the pinned …" | The hub's certificate changed (`tls self-signed` was re-run). Pair again with a fresh code. |
+| "can't reach the HTTP proxy …", "the proxy refused the connection", "the proxy needs a user name and password" | Check the **Proxy** section on the Hub page: address, type (`http://` vs `socks5://`), login. |
+| "the system proxy uses an auto-config script" | PAC files aren't supported; choose *Manual* and enter the proxy address. |
 | "invalid peer certificate: UnknownIssuer" | The hub uses a self-signed certificate but the connector has no pin: pair with a pairing code instead of typing the URL. |
 | Claude says "no machines connected" | The connector isn't running or isn't paired, or *Pause agent access* is on, or all machines are hidden. |
 | A machine shows **error: …** | Use **Save and test** on it for details (wrong password, host unreachable, SSH not installed…). |

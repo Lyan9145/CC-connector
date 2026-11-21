@@ -7,6 +7,7 @@ mod gui;
 mod ops;
 mod paths;
 mod pin;
+mod proxy;
 mod redact;
 mod runtime;
 mod stats;
@@ -48,6 +49,13 @@ enum Cmd {
         /// Name of this connector as shown to the hub.
         #[arg(long)]
         name: Option<String>,
+        /// Reach the hub through a proxy: http://host:port, socks5://host:port,
+        /// `system` (the OS proxy settings) or `off`.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// User name for the proxy (empty = none); prompts for its password.
+        #[arg(long)]
+        proxy_user: Option<String>,
     },
     /// Add a connection.
     Add {
@@ -348,7 +356,7 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Cmd::Hub { pair, url, token, token_stdin, name } => {
+        Cmd::Hub { pair, url, token, token_stdin, name, proxy, proxy_user } => {
             if let Some(code) = pair {
                 let p = store::apply_pairing(&code)?;
                 println!("paired with {}{}", p.url, if p.cert.is_some() { " (pinned self-signed certificate)" } else { "" });
@@ -377,12 +385,47 @@ fn main() -> Result<()> {
             if let Some(t) = tok {
                 store::set_secret(store::HUB_TOKEN, t.trim())?;
             }
+            if let Some(p) = proxy {
+                match p.trim() {
+                    "off" | "none" | "" => c.proxy.mode = store::ProxyMode::Off,
+                    "system" => c.proxy.mode = store::ProxyMode::System,
+                    u => {
+                        let r = proxy::parse(u)?;
+                        c.proxy.mode = store::ProxyMode::Manual;
+                        c.proxy.url = u.to_string();
+                        if !r.user.is_empty() && proxy_user.is_none() {
+                            c.proxy.user = r.user;
+                        }
+                    }
+                }
+            }
+            if let Some(u) = proxy_user {
+                c.proxy.user = u.trim().to_string();
+                if c.proxy.user.is_empty() {
+                    store::del_secret(store::PROXY_PW)?;
+                } else {
+                    let pw = rpassword::prompt_password("proxy password (empty = none): ")?;
+                    if pw.is_empty() {
+                        store::del_secret(store::PROXY_PW)?;
+                    } else {
+                        store::set_secret(store::PROXY_PW, &pw)?;
+                    }
+                }
+            }
             store::save(&c)?;
             println!("name:  {}", c.name);
             println!("url:   {}", if c.hub_url.is_empty() { "(not set)" } else { &c.hub_url });
             println!("token: {}", if store::get_secret(store::HUB_TOKEN)?.is_some() { "saved" } else { "(not set)" });
             if !c.hub_cert.is_empty() {
                 println!("cert:  {} (pinned)", c.hub_cert);
+            }
+            match c.proxy.mode {
+                store::ProxyMode::Off => println!("proxy: off"),
+                store::ProxyMode::System => println!("proxy: system ({})", proxy::describe_system()),
+                store::ProxyMode::Manual => println!("proxy: {}", c.proxy.url),
+            }
+            if !c.proxy.user.is_empty() {
+                println!("proxy user: {}", c.proxy.user);
             }
             println!("config: {}", store::config_path().display());
             Ok(())

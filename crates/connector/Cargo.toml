@@ -42,7 +42,7 @@ winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_Registry"] }
 rfd = { version = "0.15", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -7,13 +7,13 @@ use crate::analytics;
 use crate::filters;
 use crate::paths;
 use crate::runtime::{self, Answer, Approval, Decision, Running, Runtime, SessionView};
-use crate::store::{self, Access, Auth, Connection, FilterAction, FolderAccess, FolderRule, Kind, Perm};
+use crate::store::{self, Access, Auth, Connection, FilterAction, FolderAccess, FolderRule, Kind, Perm, ProxyCfg, ProxyMode};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Connections,
     Hub,
@@ -25,6 +25,8 @@ enum Tab {
 #[derive(Default, Clone)]
 struct Form {
     conn: Connection,
+    /// as last saved, to spot unsaved changes
+    base: Connection,
     /// name before editing ("" for a new connection)
     orig: String,
     password: String,
@@ -32,6 +34,16 @@ struct Form {
     has_pw: bool,
     has_pp: bool,
     clear_pw: bool,
+    /// highlight missing fields (set by a failed save)
+    check: bool,
+    /// field to scroll to once
+    scroll_to: Option<&'static str>,
+}
+
+impl Form {
+    fn dirty(&self) -> bool {
+        self.conn != self.base || !self.password.is_empty() || !self.passphrase.is_empty() || self.clear_pw
+    }
 }
 
 struct HubForm {
@@ -40,11 +52,74 @@ struct HubForm {
     url: String,
     token: String,
     has_token: bool,
+    proxy: ProxyCfg,
+    proxy_pw: String,
+    has_proxy_pw: bool,
+    clear_proxy_pw: bool,
+    /// saved (name, url, proxy), to spot unsaved changes
+    base: (String, String, ProxyCfg),
+    /// what the OS proxy settings say (refreshed when "System" is picked)
+    sys_proxy: String,
+    check: bool,
+    scroll_to: Option<&'static str>,
+}
+
+impl HubForm {
+    fn new(cfg: &store::Config, has_token: bool, has_proxy_pw: bool) -> Self {
+        HubForm {
+            pair: String::new(),
+            name: cfg.name.clone(),
+            url: cfg.hub_url.clone(),
+            token: String::new(),
+            has_token,
+            proxy: cfg.proxy.clone(),
+            proxy_pw: String::new(),
+            has_proxy_pw,
+            clear_proxy_pw: false,
+            base: (cfg.name.clone(), cfg.hub_url.clone(), cfg.proxy.clone()),
+            sys_proxy: if cfg.proxy.mode == ProxyMode::System { crate::proxy::describe_system() } else { String::new() },
+            check: false,
+            scroll_to: None,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        (&self.name, &self.url, &self.proxy) != (&self.base.0, &self.base.1, &self.base.2)
+            || !self.token.trim().is_empty()
+            || !self.proxy_pw.is_empty()
+            || self.clear_proxy_pw
+    }
+}
+
+/// A page with its own Save button.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Page {
+    Connection,
+    Hub,
+    Security,
+}
+
+/// Somewhere the owner asked to go (held back while unsaved changes are
+/// confirmed).
+#[derive(Clone, PartialEq, Debug)]
+enum Nav {
+    Tab(Tab),
+    /// open a connection in the form (None = a new one)
+    Open(Option<String>),
+    CloseForm,
+    Quit,
+}
+
+/// The "Clear data" confirmation.
+#[derive(Clone, Copy)]
+struct ClearDlg {
+    what: store::ClearWhat,
+    activity: bool,
 }
 
 enum Event {
     Msg(String, bool),
-    Saved { name: String, then_test: bool },
+    Saved { conn: Connection, then_test: bool },
     Deleted(String),
     Secrets { name: String, has_pw: bool, has_pp: bool },
     HubSaved,
@@ -57,6 +132,7 @@ enum Event {
     /// folder browser listing: (seq, Ok((home, abs, dirs)))
     Listed { seq: u64, result: Result<(String, String, Vec<String>), String> },
     SecuritySaved,
+    Cleared(ClearDlg),
 }
 
 /// In-app folder browser (SSH machines, and local ones outside Windows).
@@ -119,6 +195,13 @@ struct App {
     closing: bool,
     /// alert count we already flashed the taskbar for
     seen_alerts: usize,
+    /// waiting for "Save changes?" before going there
+    leave: Option<Nav>,
+    /// go there once the pending save succeeds
+    after_save: Option<Nav>,
+    clear_dlg: Option<ClearDlg>,
+    /// "Getting started" hidden for this run
+    guide_hidden: bool,
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -147,37 +230,7 @@ pub fn run_with(preview: bool) -> Result<()> {
         rt.start();
         rt
     };
-    let cfg = rt.cfg.read().unwrap().clone();
-    let hub = HubForm {
-        pair: String::new(),
-        name: cfg.name.clone(),
-        url: cfg.hub_url.clone(),
-        token: String::new(),
-        has_token: store::get_secret(store::HUB_TOKEN).ok().flatten().is_some(),
-    };
-    let tab = if cfg.hub_url.is_empty() { Tab::Hub } else { Tab::Connections };
-    let app = App {
-        rt,
-        tokio,
-        tab,
-        form: None,
-        hub,
-        msg: (String::new(), false),
-        test: None,
-        busy: false,
-        events: Default::default(),
-        seen_approval: 0,
-        retrying: HashSet::new(),
-        page: Default::default(),
-        demo: preview.then(crate::stats::demo),
-        browser: None,
-        choice: Default::default(),
-        secstate: SecState { sec: cfg.security.clone(), dirty: false, test: String::new(), test_on: filters::Scope::Cmd },
-        confirm_close: false,
-        closing: false,
-        seen_alerts: 0,
-    };
-    let app = App { tab: if preview { Tab::Activity } else { app.tab }, ..app };
+    let app = App::new(rt, tokio, preview);
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1040.0, 760.0])
         .with_min_inner_size(MIN_SIZE)
@@ -198,6 +251,46 @@ pub fn run_with(preview: bool) -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+impl App {
+    fn new(rt: Arc<Runtime>, tokio: tokio::runtime::Runtime, preview: bool) -> App {
+        let cfg = rt.cfg.read().unwrap().clone();
+        let has_token = store::get_secret(store::HUB_TOKEN).ok().flatten().is_some();
+        let has_proxy_pw = !cfg.proxy.user.is_empty() && store::get_secret(store::PROXY_PW).ok().flatten().is_some();
+        let tab = if preview {
+            Tab::Activity
+        } else if cfg.hub_url.is_empty() {
+            Tab::Hub
+        } else {
+            Tab::Connections
+        };
+        App {
+            rt,
+            tokio,
+            tab,
+            form: None,
+            hub: HubForm::new(&cfg, has_token, has_proxy_pw),
+            msg: (String::new(), false),
+            test: None,
+            busy: false,
+            events: Default::default(),
+            seen_approval: 0,
+            retrying: HashSet::new(),
+            page: Default::default(),
+            demo: preview.then(crate::stats::demo),
+            browser: None,
+            choice: Default::default(),
+            secstate: SecState { sec: cfg.security.clone(), dirty: false, test: String::new(), test_on: filters::Scope::Cmd },
+            confirm_close: false,
+            closing: false,
+            seen_alerts: 0,
+            leave: None,
+            after_save: None,
+            clear_dlg: None,
+            guide_hidden: false,
+        }
+    }
 }
 
 /// Higher-contrast text than egui's defaults, in both themes.
@@ -862,6 +955,80 @@ fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
     });
 }
 
+/// Label for a form field; required ones end in a red "*".
+fn field_label(ui: &mut egui::Ui, text: &str, required: bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        ui.label(text);
+        if required {
+            ui.label(RichText::new("*").color(RED).strong());
+        }
+    })
+    .response
+}
+
+/// A form field; outlined in red with the problem next to it when `err` is
+/// set, and scrolled into view (and focused) when `scroll` is set.
+fn checked(ui: &mut egui::Ui, err: Option<&str>, scroll: bool, add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    ui.horizontal(|ui| {
+        let r = if err.is_some() {
+            ui.scope(|ui| {
+                let s = Stroke::new(1.5_f32, RED);
+                let v = ui.visuals_mut();
+                v.widgets.inactive.bg_stroke = s;
+                v.widgets.hovered.bg_stroke = s;
+                v.selection.stroke = s;
+                add(ui)
+            })
+            .inner
+        } else {
+            add(ui)
+        };
+        if let Some(e) = err {
+            ui.label(RichText::new(e).color(RED));
+        }
+        if scroll {
+            r.scroll_to_me(Some(egui::Align::Center));
+            r.request_focus();
+        }
+        r
+    })
+    .inner
+}
+
+/// Human name of a form field key, for messages.
+fn field_name(k: &str) -> &'static str {
+    match k {
+        "name" => "Name",
+        "host" => "Host",
+        "user" => "User",
+        "key" => "Key file",
+        "password" => "Password",
+        "hub-name" => "Connector name",
+        "url" => "Hub URL",
+        "token" => "Token",
+        "proxy" => "Proxy address",
+        _ => "a field",
+    }
+}
+
+/// Numbered step marker for "Getting started"; a check mark when done.
+fn step_marker(ui: &mut egui::Ui, n: usize, done: bool, current: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    let c = rect.center();
+    let p = ui.painter();
+    if done {
+        p.circle_filled(c, 10.0, GREEN);
+        let s = Stroke::new(2.2_f32, Color32::WHITE);
+        p.line_segment([c + egui::vec2(-4.5, 0.2), c + egui::vec2(-1.2, 3.6)], s);
+        p.line_segment([c + egui::vec2(-1.2, 3.6), c + egui::vec2(4.8, -3.6)], s);
+    } else {
+        let col = if current { ACCENT } else { GREY };
+        p.circle_stroke(c, 9.5, Stroke::new(1.6_f32, col));
+        p.text(c, egui::Align2::CENTER_CENTER, n.to_string(), egui::FontId::proportional(13.0), col);
+    }
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(title).strong().size(15.0));
@@ -894,21 +1061,32 @@ impl App {
             match e {
                 Event::Msg(m, err) => {
                     self.busy = false;
+                    if err {
+                        // a failed save keeps the page open
+                        self.after_save = None;
+                    }
                     self.msg = (m, err);
                 }
-                Event::Saved { name, then_test } => {
+                Event::Saved { conn, then_test } => {
                     self.busy = false;
+                    let name = conn.name.clone();
                     if let Some(f) = self.form.as_mut() {
                         f.orig = name.clone();
+                        f.conn = conn.clone();
+                        f.base = conn;
                         f.has_pw = (f.has_pw && !f.clear_pw) || !f.password.is_empty();
                         f.has_pp = f.has_pp || !f.passphrase.is_empty();
                         f.password.clear();
                         f.passphrase.clear();
                         f.clear_pw = false;
+                        f.check = false;
                     }
                     self.msg = (format!("saved '{name}'"), false);
                     if then_test {
                         self.start_test(ctx, name);
+                    }
+                    if let Some(n) = self.after_save.take() {
+                        self.go(ctx, n);
                     }
                 }
                 Event::Deleted(name) => {
@@ -924,13 +1102,27 @@ impl App {
                 }
                 Event::HubSaved => {
                     self.busy = false;
-                    self.hub.has_token = self.hub.has_token || !self.hub.token.trim().is_empty();
-                    self.hub.token.clear();
+                    let h = &mut self.hub;
+                    h.has_token = h.has_token || !h.token.trim().is_empty();
+                    h.token.clear();
+                    h.has_proxy_pw = !h.proxy.user.trim().is_empty() && ((h.has_proxy_pw && !h.clear_proxy_pw) || !h.proxy_pw.is_empty());
+                    h.proxy_pw.clear();
+                    h.clear_proxy_pw = false;
+                    h.name = h.name.trim().to_string();
+                    h.url = h.url.trim().to_string();
+                    h.proxy.url = h.proxy.url.trim().to_string();
+                    h.proxy.user = h.proxy.user.trim().to_string();
+                    h.base = (h.name.clone(), h.url.clone(), h.proxy.clone());
+                    h.check = false;
                     self.msg = ("hub settings saved".into(), false);
+                    if let Some(n) = self.after_save.take() {
+                        self.go(ctx, n);
+                    }
                 }
                 Event::Paired { url, pinned } => {
                     self.busy = false;
                     self.hub.url = url.clone();
+                    self.hub.base.1 = url.clone();
                     self.hub.pair.clear();
                     self.hub.has_token = true;
                     self.msg = (format!("paired with {url}{}", if pinned { " (certificate pinned)" } else { "" }), false);
@@ -973,6 +1165,34 @@ impl App {
                     self.busy = false;
                     self.secstate.dirty = false;
                     self.msg = ("security filters saved".into(), false);
+                    if let Some(n) = self.after_save.take() {
+                        self.go(ctx, n);
+                    }
+                }
+                Event::Cleared(d) => {
+                    self.busy = false;
+                    let cfg = self.rt.cfg.read().unwrap().clone();
+                    let mut gone = vec![];
+                    if d.what.connections {
+                        self.form = None;
+                        self.test = None;
+                        gone.push("connections");
+                    }
+                    if d.what.hub {
+                        self.hub = HubForm::new(&cfg, false, false);
+                        self.tab = Tab::Hub;
+                        gone.push("hub settings");
+                    }
+                    if d.what.security {
+                        self.secstate.sec = cfg.security.clone();
+                        self.secstate.dirty = false;
+                        gone.push("security settings");
+                    }
+                    if d.activity {
+                        gone.push("statistics and logs");
+                    }
+                    self.guide_hidden = false;
+                    self.msg = (format!("cleared {}", gone.join(", ")), false);
                 }
             }
         }
@@ -981,7 +1201,7 @@ impl App {
     fn open_form(&mut self, name: Option<&str>) {
         let conn = name.and_then(|n| self.rt.cfg.read().unwrap().get(n).cloned()).unwrap_or_default();
         let orig = name.unwrap_or("").to_string();
-        self.form = Some(Form { conn, orig: orig.clone(), ..Default::default() });
+        self.form = Some(Form { base: conn.clone(), conn, orig: orig.clone(), ..Default::default() });
         self.test = None;
         self.msg = (String::new(), false);
         if !orig.is_empty() {
@@ -995,31 +1215,67 @@ impl App {
         }
     }
 
-    fn validate(&self, f: &Form) -> Result<Connection> {
+    /// Missing or invalid fields of the connection form: (field, problem).
+    fn problems(&self, f: &Form) -> Vec<(&'static str, String)> {
+        let c = &f.conn;
+        let mut v = vec![];
+        let name = c.name.trim();
+        if name.is_empty() {
+            v.push(("name", "required".into()));
+        } else if store::validate_name(name).is_err() {
+            v.push(("name", "use up to 40 letters, digits, '-', '_' or '.'".into()));
+        } else if name != f.orig && self.rt.cfg.read().unwrap().get(name).is_some() {
+            v.push(("name", format!("'{name}' is already used")));
+        }
+        if c.kind == Kind::Ssh {
+            if c.host.trim().is_empty() {
+                v.push(("host", "required".into()));
+            }
+            if c.user.trim().is_empty() {
+                v.push(("user", "required".into()));
+            }
+            match c.auth {
+                Auth::Key if c.key_path.trim().is_empty() => v.push(("key", "required for key login".into())),
+                Auth::Password if f.password.is_empty() && (!f.has_pw || f.clear_pw) => {
+                    v.push(("password", "required for password login".into()))
+                }
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn validate(&self, f: &Form) -> std::result::Result<Connection, Vec<(&'static str, String)>> {
+        let p = self.problems(f);
+        if !p.is_empty() {
+            return Err(p);
+        }
         let mut c = f.conn.clone();
         c.name = c.name.trim().to_string();
         c.host = c.host.trim().to_string();
         c.user = c.user.trim().to_string();
         c.key_path = c.key_path.trim().to_string();
-        store::validate_name(&c.name)?;
-        if c.kind == Kind::Ssh && (c.host.is_empty() || c.user.is_empty()) {
-            bail!("host and user are required for SSH");
-        }
-        if c.kind == Kind::Ssh && c.auth == Auth::Key && c.key_path.is_empty() {
-            bail!("key file is required for key authentication");
-        }
-        if c.name != f.orig && self.rt.cfg.read().unwrap().get(&c.name).is_some() {
-            bail!("a connection named '{}' already exists", c.name);
-        }
         Ok(c)
+    }
+
+    /// After a failed save: say what's missing, highlight it, scroll there.
+    fn missing(&mut self, p: &[(&'static str, String)]) -> String {
+        self.after_save = None;
+        let mut names: Vec<&str> = p.iter().map(|(k, _)| field_name(k)).collect();
+        names.dedup();
+        format!("Can't save yet: fill in or fix {}.", names.join(", "))
     }
 
     fn save(&mut self, ctx: &egui::Context, then_test: bool) {
         let Some(f) = self.form.clone() else { return };
         let c = match self.validate(&f) {
             Ok(c) => c,
-            Err(e) => {
-                self.msg = (format!("{e:#}"), true);
+            Err(p) => {
+                self.msg = (self.missing(&p), true);
+                if let Some(f) = self.form.as_mut() {
+                    f.check = true;
+                    f.scroll_to = p.first().map(|x| x.0);
+                }
                 return;
             }
         };
@@ -1027,7 +1283,7 @@ impl App {
             self.test = Some("saving…".into());
         }
         self.bg(ctx, move |rt| {
-            let r = (|| -> Result<String> {
+            let r = (|| -> Result<Connection> {
                 let mut c = c;
                 let mut cfg = store::load()?;
                 if f.orig.is_empty() {
@@ -1053,10 +1309,10 @@ impl App {
                 }
                 store::save(&cfg)?;
                 let _ = rt.reload();
-                Ok(c.name)
+                Ok(c)
             })();
             match r {
-                Ok(name) => Event::Saved { name, then_test },
+                Ok(conn) => Event::Saved { conn, then_test },
                 Err(e) => Event::Msg(format!("{e:#}"), true),
             }
         });
@@ -1097,6 +1353,7 @@ impl App {
     fn set_visible(&mut self, ctx: &egui::Context, name: String, on: bool) {
         if let Some(f) = self.form.as_mut().filter(|f| f.orig == name) {
             f.conn.enabled = on;
+            f.base.enabled = on;
         }
         self.bg(ctx, move |rt| {
             let r = store::load().and_then(|mut c| {
@@ -1108,6 +1365,373 @@ impl App {
             let _ = rt.reload();
             match r {
                 Ok(()) => Event::Msg(format!("'{name}' is now {}", if on { "visible to the agent" } else { "hidden from the agent" }), false),
+                Err(e) => Event::Msg(format!("{e:#}"), true),
+            }
+        });
+    }
+
+    /// Unsaved changes, if any: which page and how to name them.
+    fn dirty(&self) -> Option<(Page, String)> {
+        if let Some(f) = self.form.as_ref().filter(|f| f.dirty()) {
+            let what = if f.orig.is_empty() { "the new connection".to_string() } else { format!("connection '{}'", f.orig) };
+            return Some((Page::Connection, what));
+        }
+        if self.hub.dirty() {
+            return Some((Page::Hub, "the hub settings".into()));
+        }
+        if self.secstate.dirty {
+            return Some((Page::Security, "the security filters".into()));
+        }
+        None
+    }
+
+    /// Whether going to `n` hides the page with unsaved changes.
+    fn leaves(&self, page: Page, n: &Nav) -> bool {
+        let tab = match page {
+            Page::Connection => Tab::Connections,
+            Page::Hub => Tab::Hub,
+            Page::Security => Tab::Security,
+        };
+        match n {
+            Nav::Tab(t) => *t != tab,
+            Nav::Open(name) => {
+                page != Page::Connection || name.is_none() || self.form.as_ref().is_none_or(|f| Some(&f.orig) != name.as_ref() || f.orig.is_empty())
+            }
+            Nav::CloseForm => page == Page::Connection,
+            Nav::Quit => true,
+        }
+    }
+
+    /// Go somewhere, first asking to save unsaved changes it would hide.
+    fn nav(&mut self, ctx: &egui::Context, n: Nav) {
+        match self.dirty() {
+            Some((page, _)) if self.leaves(page, &n) => self.leave = Some(n),
+            _ => self.go(ctx, n),
+        }
+    }
+
+    fn go(&mut self, ctx: &egui::Context, n: Nav) {
+        match n {
+            Nav::Tab(t) => self.tab = t,
+            Nav::Open(name) => {
+                self.tab = Tab::Connections;
+                let same = self.form.as_ref().is_some_and(|f| !f.orig.is_empty() && Some(&f.orig) == name.as_ref());
+                if !same {
+                    self.open_form(name.as_deref());
+                }
+            }
+            Nav::CloseForm => {
+                self.form = None;
+                self.test = None;
+            }
+            Nav::Quit => {
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Throw away unsaved changes on `page`.
+    fn discard(&mut self, page: Page) {
+        match page {
+            Page::Connection => {
+                if let Some(f) = self.form.as_mut() {
+                    if f.orig.is_empty() {
+                        self.form = None;
+                    } else {
+                        f.conn = f.base.clone();
+                        f.password.clear();
+                        f.passphrase.clear();
+                        f.clear_pw = false;
+                        f.check = false;
+                    }
+                }
+            }
+            Page::Hub => {
+                let h = &mut self.hub;
+                (h.name, h.url, h.proxy) = h.base.clone();
+                h.token.clear();
+                h.proxy_pw.clear();
+                h.clear_proxy_pw = false;
+                h.check = false;
+            }
+            Page::Security => {
+                self.secstate.sec = self.rt.cfg.read().unwrap().security.clone();
+                self.secstate.dirty = false;
+            }
+        }
+        if self.msg.1 {
+            self.msg = (String::new(), false);
+        }
+    }
+
+    /// "Save changes?" when leaving a page with unsaved changes.
+    fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        let Some(n) = self.leave.clone() else { return };
+        let Some((page, what)) = self.dirty() else {
+            self.leave = None;
+            self.go(ctx, n);
+            return;
+        };
+        let mut choice = None;
+        let busy = self.busy;
+        let r = egui::Modal::new(egui::Id::new("unsaved")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(RichText::new("Save changes?").strong().size(17.0));
+            ui.add_space(4.0);
+            ui.label(format!("You changed {what} but haven't saved."));
+            if n == Nav::Quit {
+                ui.label(RichText::new("Unsaved changes are lost when the window closes.").weak());
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(RichText::new("Save").strong())).clicked() {
+                    choice = Some("save");
+                }
+                if ui.button(RichText::new("Discard changes").color(RED)).clicked() {
+                    choice = Some("discard");
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some("cancel");
+                }
+            });
+        });
+        if choice.is_none() && r.should_close() {
+            choice = Some("cancel");
+        }
+        match choice {
+            Some("save") => {
+                self.leave = None;
+                self.after_save = Some(n);
+                match page {
+                    Page::Connection => self.save(ctx, false),
+                    Page::Hub => self.save_hub(ctx),
+                    Page::Security => self.save_security(ctx),
+                }
+            }
+            Some("discard") => {
+                self.leave = None;
+                self.discard(page);
+                self.go(ctx, n);
+            }
+            Some(_) => self.leave = None,
+            None => {}
+        }
+    }
+
+    /// "Clear data" confirmation.
+    fn clear_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.clear_dlg else { return };
+        let running = self.rt.busy();
+        let mut choice = None;
+        let r = egui::Modal::new(egui::Id::new("clear-data")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.label(RichText::new("Clear data?").strong().size(17.0));
+            ui.add_space(4.0);
+            ui.label("Remove from this computer:");
+            ui.checkbox(&mut d.what.connections, "Connections, their saved passwords and trusted host keys");
+            ui.checkbox(&mut d.what.hub, "Hub pairing, token and proxy settings");
+            ui.checkbox(&mut d.what.security, "Security filter settings (back to the defaults)");
+            ui.checkbox(&mut d.activity, "Statistics, request log and security alerts");
+            ui.add_space(4.0);
+            ui.label(RichText::new("This can't be undone. Nothing on your machines or on the hub is touched.").weak());
+            if d.what.hub {
+                ui.label(RichText::new("The connector goes offline until you pair it again.").color(AMBER));
+            }
+            if running > 0 && (d.what.connections || d.what.hub) {
+                ui.label(RichText::new(format!("The agent is using your machines right now ({running} running); those calls will fail.")).color(AMBER));
+            }
+            ui.add_space(10.0);
+            let any = d.what.connections || d.what.hub || d.what.security || d.activity;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(any, egui::Button::new(RichText::new("Clear selected").strong().color(RED))).clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if choice.is_none() && r.should_close() {
+            choice = Some(false);
+        }
+        match choice {
+            None => self.clear_dlg = Some(d),
+            Some(false) => self.clear_dlg = None,
+            Some(true) => {
+                self.clear_dlg = None;
+                self.bg(ctx, move |rt| {
+                    let r = store::clear_data(d.what);
+                    if d.what.connections || d.what.hub {
+                        rt.revoke_all();
+                    }
+                    if d.activity {
+                        rt.clear_activity();
+                    }
+                    let _ = rt.reload();
+                    match r {
+                        Ok(()) => Event::Cleared(d),
+                        Err(e) => Event::Msg(format!("{e:#}"), true),
+                    }
+                });
+            }
+        }
+    }
+
+    /// "Getting started" until the hub is paired, a machine is added and
+    /// the agent has used one. Returns where the owner wants to go.
+    fn guide(&mut self, ui: &mut egui::Ui) -> Option<Nav> {
+        let (paired, has_conn) = {
+            let cfg = self.rt.cfg.read().unwrap();
+            (!cfg.hub_url.is_empty() && self.hub.has_token, !cfg.connections.is_empty())
+        };
+        let hs = self.rt.hub_status.lock().unwrap().clone();
+        let online = hs.starts_with("connected");
+        let used = !self.rt.stats.lock().unwrap().last_active.is_empty();
+        if self.guide_hidden || (paired && online && has_conn && used) {
+            return None;
+        }
+        let mut go = None;
+        egui::Frame::group(ui.style()).stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.7))).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Getting started").strong().size(16.0));
+                ui.label(RichText::new("three steps to let Claude Code work on your machines").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Hide").on_hover_text("Hide until the connector is restarted").clicked() {
+                        self.guide_hidden = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            let steps_done = [paired && online, has_conn, used];
+            let current = steps_done.iter().position(|d| !d).unwrap_or(3);
+            let step = |ui: &mut egui::Ui, i: usize, title: &str, body: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.horizontal_top(|ui| {
+                    step_marker(ui, i + 1, steps_done[i], i == current);
+                    ui.vertical(|ui| {
+                        let t = RichText::new(title).strong().size(14.5);
+                        ui.label(if steps_done[i] { t.color(GREEN) } else { t });
+                        body(ui);
+                    });
+                });
+                ui.add_space(4.0);
+            };
+            step(ui, 0, "Pair with the hub", &mut |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("On the Claude Code server run");
+                    ui.label(RichText::new("ccc-hub token new <name>").code());
+                    ui.label("and paste the code under Quick setup on the Hub page.");
+                });
+                if paired && !online {
+                    ui.label(RichText::new(format!("Paired but not connected: {hs}")).color(AMBER));
+                }
+                if !paired && self.tab != Tab::Hub && ui.button("Open the Hub page").clicked() {
+                    go = Some(Nav::Tab(Tab::Hub));
+                }
+            });
+            step(ui, 1, "Add your machines", &mut |ui| {
+                ui.label(
+                    "Add this computer (type \"This computer\") and any SSH host it can reach, such as a robot on the \
+                     same network. Choose what the agent may do there and which folders it may use.",
+                );
+                if !has_conn && ui.button("+ Add connection").clicked() {
+                    go = Some(Nav::Open(None));
+                }
+            });
+            step(ui, 2, "Use it from Claude Code", &mut |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("On the server run");
+                    ui.label(RichText::new("claude mcp add remote -- ccc-hub mcp").code());
+                    ui.label("once, then ask Claude to list your machines.");
+                });
+            });
+        });
+        ui.add_space(8.0);
+        go
+    }
+
+    /// Missing or invalid hub settings: (field, problem).
+    fn hub_problems(&self) -> Vec<(&'static str, String)> {
+        let h = &self.hub;
+        let mut v = vec![];
+        let name = h.name.trim();
+        if name.is_empty() {
+            v.push(("hub-name", "required".into()));
+        } else if store::validate_name(name).is_err() {
+            v.push(("hub-name", "use up to 40 letters, digits, '-', '_' or '.'".into()));
+        }
+        let url = h.url.trim();
+        if url.is_empty() {
+            v.push(("url", "required (or use a pairing code above)".into()));
+        } else if !(url.starts_with("wss://") || url.starts_with("ws://")) {
+            v.push(("url", "must start with wss://".into()));
+        }
+        if h.token.trim().is_empty() && !h.has_token {
+            v.push(("token", "required".into()));
+        }
+        if h.proxy.mode == ProxyMode::Manual {
+            if h.proxy.url.trim().is_empty() {
+                v.push(("proxy", "required".into()));
+            } else if let Err(e) = crate::proxy::parse(&h.proxy.url) {
+                v.push(("proxy", format!("{e:#}")));
+            }
+        }
+        v
+    }
+
+    fn save_hub(&mut self, ctx: &egui::Context) {
+        let p = self.hub_problems();
+        if !p.is_empty() {
+            self.msg = (self.missing(&p), true);
+            self.hub.check = true;
+            self.hub.scroll_to = p.first().map(|x| x.0);
+            return;
+        }
+        let h = &self.hub;
+        let (url, name, token) = (h.url.trim().to_string(), h.name.trim().to_string(), h.token.trim().to_string());
+        let mut proxy = h.proxy.clone();
+        proxy.url = proxy.url.trim().to_string();
+        proxy.user = proxy.user.trim().to_string();
+        let (pw, clear_pw) = (h.proxy_pw.clone(), h.clear_proxy_pw);
+        self.bg(ctx, move |rt| {
+            let r = (|| -> Result<()> {
+                let mut c = store::load()?;
+                if c.hub_url != url {
+                    c.hub_cert.clear();
+                }
+                c.hub_url = url;
+                c.name = name;
+                if !token.is_empty() {
+                    store::set_secret(store::HUB_TOKEN, &token)?;
+                }
+                if proxy.user.is_empty() || clear_pw {
+                    store::del_secret(store::PROXY_PW)?;
+                }
+                if !proxy.user.is_empty() && !pw.is_empty() {
+                    store::set_secret(store::PROXY_PW, &pw)?;
+                }
+                c.proxy = proxy;
+                store::save(&c)
+            })();
+            let _ = rt.reload();
+            match r {
+                Ok(()) => Event::HubSaved,
+                Err(e) => Event::Msg(format!("{e:#}"), true),
+            }
+        });
+    }
+
+    fn save_security(&mut self, ctx: &egui::Context) {
+        let sec = self.secstate.sec.clone();
+        self.bg(ctx, move |rt| {
+            let r = store::load().and_then(|mut c| {
+                c.security = sec;
+                store::save(&c)
+            });
+            let _ = rt.reload();
+            match r {
+                Ok(()) => Event::SecuritySaved,
                 Err(e) => Event::Msg(format!("{e:#}"), true),
             }
         });
@@ -1148,7 +1772,8 @@ impl App {
             let busy = self.rt.busy();
             let waiting = self.rt.approvals.lock().unwrap().len();
             if busy > 0 && running_pill(ui, &format!("{busy} running")).on_hover_text("The agent is using your machines; click for details").clicked() {
-                self.tab = Tab::Activity;
+                let ctx = ui.ctx().clone();
+                self.nav(&ctx, Nav::Tab(Tab::Activity));
             }
             if waiting > 0 {
                 badge(ui, &format!("{waiting} waiting for you"), AMBER, false);
@@ -1192,7 +1817,8 @@ impl App {
                     RichText::new(name).size(14.5)
                 };
                 if ui.selectable_label(self.tab == t, label).clicked() {
-                    self.tab = t;
+                    let ctx = ui.ctx().clone();
+                    self.nav(&ctx, Nav::Tab(t));
                 }
             }
         });
@@ -1202,7 +1828,7 @@ impl App {
         egui::SidePanel::left("list").resizable(true).default_width(240.0).show(ctx, |ui| {
             ui.add_space(6.0);
             if ui.button("+ Add connection").clicked() {
-                self.open_form(None);
+                self.nav(ctx, Nav::Open(None));
             }
             ui.separator();
             let cfg = self.rt.cfg.read().unwrap().clone();
@@ -1248,8 +1874,7 @@ impl App {
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 if ui.selectable_label(sel, text).on_hover_text(tip).clicked() {
-                                    let n = c.name.clone();
-                                    self.open_form(Some(&n));
+                                    self.nav(ctx, Nav::Open(Some(c.name.clone())));
                                 }
                             });
                         });
@@ -1267,19 +1892,35 @@ impl App {
                     "Select a connection or add one. The agent only sees each connection's name, OS and \
                      description, never hosts, users or passwords.",
                 );
+                ui.add_space(8.0);
+                if let Some(n) = self.guide(ui) {
+                    self.nav(ctx, n);
+                }
                 self.msg_line(ui);
                 return;
             }
             let mut action = None;
             let mut browse_row = 0;
             let busy = self.busy;
+            // live problems once a save has failed, so fixed fields turn back to normal
+            let errs: std::collections::HashMap<&'static str, String> = match &self.form {
+                Some(f) if f.check => self.problems(f).into_iter().collect(),
+                _ => Default::default(),
+            };
+            if errs.is_empty() && self.msg.1 && self.msg.0.starts_with("Can't save yet") {
+                self.msg = (String::new(), false);
+            }
+            let scroll_to = self.form.as_mut().and_then(|f| f.scroll_to.take());
+            let e = |k: &str| errs.get(k).map(String::as_str);
+            let sc = |k: &str| scroll_to == Some(k);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let f = self.form.as_mut().unwrap();
                 ui.heading(if f.orig.is_empty() { "New connection".to_string() } else { format!("Edit '{}'", f.orig) });
                 ui.add_space(6.0);
                 egui::Grid::new("form").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut f.conn.name).on_hover_text("What the agent calls this machine, e.g. robot");
+                    field_label(ui, "Name", true);
+                    checked(ui, e("name"), sc("name"), |ui| ui.text_edit_singleline(&mut f.conn.name))
+                        .on_hover_text("What the agent calls this machine, e.g. robot");
                     ui.end_row();
                     ui.label("Type");
                     ui.horizontal(|ui| {
@@ -1288,17 +1929,18 @@ impl App {
                     });
                     ui.end_row();
                     if f.conn.kind == Kind::Ssh {
-                        ui.label("Host");
-                        ui.text_edit_singleline(&mut f.conn.host);
+                        field_label(ui, "Host", true);
+                        checked(ui, e("host"), sc("host"), |ui| ui.text_edit_singleline(&mut f.conn.host))
+                            .on_hover_text("Name or IP address as this computer reaches it, e.g. 192.168.1.20");
                         ui.end_row();
-                        ui.label("Port");
+                        field_label(ui, "Port", true);
                         let mut port = f.conn.port.to_string();
                         if ui.add(egui::TextEdit::singleline(&mut port).desired_width(70.0)).changed() {
                             f.conn.port = port.trim().parse().unwrap_or(f.conn.port);
                         }
                         ui.end_row();
-                        ui.label("User");
-                        ui.text_edit_singleline(&mut f.conn.user);
+                        field_label(ui, "User", true);
+                        checked(ui, e("user"), sc("user"), |ui| ui.text_edit_singleline(&mut f.conn.user));
                         ui.end_row();
                         ui.label("Login");
                         ui.horizontal(|ui| {
@@ -1307,8 +1949,9 @@ impl App {
                         });
                         ui.end_row();
                         if f.conn.auth == Auth::Key {
-                            ui.label("Key file");
-                            ui.text_edit_singleline(&mut f.conn.key_path).on_hover_text("e.g. ~/.ssh/id_ed25519");
+                            field_label(ui, "Key file", true);
+                            checked(ui, e("key"), sc("key"), |ui| ui.text_edit_singleline(&mut f.conn.key_path))
+                                .on_hover_text("e.g. ~/.ssh/id_ed25519");
                             ui.end_row();
                             ui.label("Key passphrase");
                             ui.add(
@@ -1319,17 +1962,13 @@ impl App {
                             ui.end_row();
                         }
                     }
-                    let pw_label = match (f.conn.kind, f.conn.auth) {
-                        (Kind::Ssh, Auth::Password) => "Password",
-                        _ => "sudo password",
-                    };
-                    ui.label(pw_label);
+                    let pw_login = f.conn.kind == Kind::Ssh && f.conn.auth == Auth::Password;
+                    field_label(ui, if pw_login { "Password" } else { "sudo password" }, pw_login);
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.password)
-                                .password(true)
-                                .hint_text(if f.has_pw { "saved (leave empty to keep)" } else { "not set" }),
-                        );
+                        let hint = if f.has_pw { "saved (leave empty to keep)" } else { "not set" };
+                        checked(ui, e("password"), sc("password"), |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(hint))
+                        });
                         if f.has_pw {
                             ui.checkbox(&mut f.clear_pw, "remove saved");
                         }
@@ -1385,7 +2024,9 @@ impl App {
                         ui.end_row();
                     }
                 });
-                ui.add_space(12.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new("* required").color(RED).size(12.0));
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!busy, |ui| {
                         if ui.button(RichText::new("Save").strong()).clicked() {
@@ -1430,10 +2071,7 @@ impl App {
                         }
                     });
                 }
-                Some("close") => {
-                    self.form = None;
-                    self.test = None;
-                }
+                Some("close") => self.nav(ctx, Nav::CloseForm),
                 Some("browse") => self.browse(ctx, browse_row),
                 _ => {}
             }
@@ -1449,99 +2087,198 @@ impl App {
     }
 
     fn hub_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Hub");
-        ui.label("The hub runs on the Claude Code server. Get a pairing code there with `ccc-hub token new <name>`.");
-        section(ui, "Quick setup");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.hub.pair)
-                    .password(true)
-                    .desired_width(460.0)
-                    .hint_text("paste pairing code (ccc1:…)"),
-            );
-            let can = !self.busy && !self.hub.pair.trim().is_empty();
-            if ui.add_enabled(can, egui::Button::new(RichText::new("Pair").strong())).clicked() {
-                let code = self.hub.pair.trim().to_string();
+        let errs: std::collections::HashMap<&'static str, String> =
+            if self.hub.check { self.hub_problems().into_iter().collect() } else { Default::default() };
+        if errs.is_empty() && self.msg.1 && self.msg.0.starts_with("Can't save yet") {
+            self.msg = (String::new(), false);
+        }
+        let scroll_to = self.hub.scroll_to.take();
+        let e = |k: &str| errs.get(k).map(String::as_str);
+        let sc = |k: &str| scroll_to == Some(k);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.heading("Hub");
+            ui.label("The hub runs on the Claude Code server. Get a pairing code there with `ccc-hub token new <name>`.");
+            ui.add_space(6.0);
+            if let Some(n) = self.guide(ui) {
                 let ctx = ui.ctx().clone();
-                self.bg(&ctx, move |rt| {
-                    let r = store::apply_pairing(&code);
-                    let _ = rt.reload();
-                    match r {
-                        Ok(p) => Event::Paired { url: p.url, pinned: p.cert.is_some() },
-                        Err(e) => Event::Msg(format!("{e:#}"), true),
-                    }
-                });
+                self.nav(&ctx, n);
             }
-        });
-        section(ui, "Manual settings");
-        egui::Grid::new("hub").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-            ui.label("Connector name");
-            ui.text_edit_singleline(&mut self.hub.name);
-            ui.end_row();
-            ui.label("Hub URL");
-            ui.add(egui::TextEdit::singleline(&mut self.hub.url).desired_width(400.0).hint_text("wss://your-server.example.com/ccc"));
-            ui.end_row();
-            ui.label("Token");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.hub.token)
-                    .password(true)
-                    .desired_width(400.0)
-                    .hint_text(if self.hub.has_token { "saved (leave empty to keep)" } else { "paste token" }),
-            );
-            ui.end_row();
-        });
-        ui.add_space(10.0);
-        let clicked = ui.add_enabled(!self.busy, egui::Button::new(RichText::new("Save and connect").strong())).clicked();
-        if clicked {
-            let url = self.hub.url.trim().to_string();
-            let name = self.hub.name.trim().to_string();
-            let token = self.hub.token.trim().to_string();
-            let check = (|| -> Result<()> {
-                if !url.is_empty() && !(url.starts_with("wss://") || url.starts_with("ws://")) {
-                    bail!("URL must start with wss:// (or ws:// for testing)");
-                }
-                store::validate_name(&name)
-            })();
-            match check {
-                Err(e) => self.msg = (format!("{e:#}"), true),
-                Ok(()) => {
+            section(ui, "Quick setup");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.hub.pair)
+                        .password(true)
+                        .desired_width(460.0)
+                        .hint_text("paste pairing code (ccc1:…)"),
+                );
+                let can = !self.busy && !self.hub.pair.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new(RichText::new("Pair").strong())).clicked() {
+                    let code = self.hub.pair.trim().to_string();
                     let ctx = ui.ctx().clone();
                     self.bg(&ctx, move |rt| {
-                        let r = (|| -> Result<()> {
-                            let mut c = store::load()?;
-                            if c.hub_url != url {
-                                c.hub_cert.clear();
-                            }
-                            c.hub_url = url;
-                            c.name = name;
-                            if !token.is_empty() {
-                                store::set_secret(store::HUB_TOKEN, &token)?;
-                            }
-                            store::save(&c)
-                        })();
+                        let r = store::apply_pairing(&code);
                         let _ = rt.reload();
                         match r {
-                            Ok(()) => Event::HubSaved,
+                            Ok(p) => Event::Paired { url: p.url, pinned: p.cert.is_some() },
                             Err(e) => Event::Msg(format!("{e:#}"), true),
                         }
                     });
                 }
-            }
-        }
-        if self.hub.url.trim().starts_with("ws://") {
+            });
+            section(ui, "Manual settings");
+            let h = &mut self.hub;
+            egui::Grid::new("hub").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
+                field_label(ui, "Connector name", true);
+                checked(ui, e("hub-name"), sc("hub-name"), |ui| ui.text_edit_singleline(&mut h.name))
+                    .on_hover_text("How the hub and the agent name this connector");
+                ui.end_row();
+                field_label(ui, "Hub URL", true);
+                checked(ui, e("url"), sc("url"), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut h.url).desired_width(400.0).hint_text("wss://your-server.example.com/ccc"))
+                });
+                ui.end_row();
+                field_label(ui, "Token", !h.has_token);
+                checked(ui, e("token"), sc("token"), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut h.token)
+                            .password(true)
+                            .desired_width(400.0)
+                            .hint_text(if h.has_token { "saved (leave empty to keep)" } else { "paste token" }),
+                    )
+                });
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            // proxy, folded unless one is in use (or has a problem)
+            let summary = match h.proxy.mode {
+                ProxyMode::Off => "off, direct connection".to_string(),
+                ProxyMode::System => "system settings".to_string(),
+                ProxyMode::Manual if h.proxy.url.trim().is_empty() => "manual".to_string(),
+                ProxyMode::Manual => h.proxy.url.trim().to_string(),
+            };
+            let open_now = (e("proxy").is_some() || sc("proxy")).then_some(true);
+            egui::CollapsingHeader::new(RichText::new(format!("Proxy  ({summary})")).strong())
+                .id_salt("proxy")
+                .default_open(h.proxy.mode != ProxyMode::Off)
+                .open(open_now)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Only the connection to the hub uses the proxy; SSH connections to your machines go \
+                             directly from this computer. The proxy sees the hub's address but not your token or \
+                             traffic (TLS goes end to end).",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Off, "Off");
+                        if ui.radio_value(&mut h.proxy.mode, ProxyMode::System, "Use system proxy").clicked() {
+                            h.sys_proxy = crate::proxy::describe_system();
+                        }
+                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Manual, "Manual");
+                    });
+                    match h.proxy.mode {
+                        ProxyMode::Off => {}
+                        ProxyMode::System => {
+                            ui.horizontal(|ui| {
+                                if h.sys_proxy.is_empty() {
+                                    h.sys_proxy = crate::proxy::describe_system();
+                                }
+                                ui.label(RichText::new(&h.sys_proxy).monospace());
+                                if ui.small_button("Refresh").clicked() {
+                                    h.sys_proxy = crate::proxy::describe_system();
+                                }
+                            });
+                            ui.label(
+                                RichText::new(if cfg!(windows) {
+                                    "From Windows proxy settings (what Clash, v2rayN and browsers use)."
+                                } else {
+                                    "From the HTTPS_PROXY / ALL_PROXY environment variables."
+                                })
+                                .weak(),
+                            );
+                        }
+                        ProxyMode::Manual => {
+                            egui::Grid::new("proxy").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
+                                field_label(ui, "Proxy address", true);
+                                checked(ui, e("proxy"), sc("proxy"), |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut h.proxy.url)
+                                            .desired_width(320.0)
+                                            .hint_text("http://127.0.0.1:7890 or socks5://host:1080"),
+                                    )
+                                });
+                                ui.end_row();
+                            });
+                        }
+                    }
+                    if h.proxy.mode != ProxyMode::Off {
+                        egui::Grid::new("proxy-login").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
+                            field_label(ui, "Proxy user", false);
+                            ui.add(egui::TextEdit::singleline(&mut h.proxy.user).desired_width(200.0).hint_text("only if the proxy needs a login"));
+                            ui.end_row();
+                            if !h.proxy.user.trim().is_empty() {
+                                field_label(ui, "Proxy password", false);
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut h.proxy_pw)
+                                            .password(true)
+                                            .desired_width(200.0)
+                                            .hint_text(if h.has_proxy_pw { "saved (leave empty to keep)" } else { "not set" }),
+                                    );
+                                    if h.has_proxy_pw {
+                                        ui.checkbox(&mut h.clear_proxy_pw, "remove saved");
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                    }
+                });
             ui.add_space(4.0);
-            ui.label(
-                RichText::new("ws:// is unencrypted: the token and all traffic can be read on the network. Prefer wss://.")
-                    .color(AMBER),
-            );
-        }
-        section(ui, "Status");
-        ui.label(self.rt.hub_status.lock().unwrap().clone());
-        let pin = self.rt.cfg.read().unwrap().hub_cert.clone();
-        if !pin.is_empty() {
-            ui.label(RichText::new(format!("pinned certificate {pin}")).monospace().weak());
-        }
-        self.msg_line(ui);
+            ui.label(RichText::new("* required").color(RED).size(12.0));
+            ui.add_space(6.0);
+            let dirty = self.hub.dirty();
+            ui.horizontal(|ui| {
+                let label = RichText::new("Save and connect").strong();
+                if ui.add_enabled(!self.busy, egui::Button::new(label)).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.save_hub(&ctx);
+                }
+                if dirty && ui.button("Undo changes").clicked() {
+                    self.discard(Page::Hub);
+                }
+            });
+            if self.hub.url.trim().starts_with("ws://") {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("ws:// is unencrypted: the token and all traffic can be read on the network. Prefer wss://.")
+                        .color(AMBER),
+                );
+            }
+            self.msg_line(ui);
+            section(ui, "Status");
+            ui.label(self.rt.hub_status.lock().unwrap().clone());
+            let pin = self.rt.cfg.read().unwrap().hub_cert.clone();
+            if !pin.is_empty() {
+                ui.label(RichText::new(format!("pinned certificate {pin}")).monospace().weak());
+            }
+            ui.add_space(14.0);
+            egui::CollapsingHeader::new(RichText::new("Clear data").strong()).id_salt("clear").show(ui, |ui| {
+                ui.label(
+                    "Remove what this connector saved on this computer: connections and their passwords, the hub \
+                     pairing, security settings, statistics. Use it to start over or before handing the computer on.",
+                );
+                ui.add_space(4.0);
+                if ui.button(RichText::new("Clear data…").color(RED)).clicked() {
+                    self.clear_dlg = Some(ClearDlg {
+                        what: store::ClearWhat { connections: true, hub: true, security: true },
+                        activity: true,
+                    });
+                }
+            });
+        });
     }
 
     /// Pop-up for requests waiting on the owner's approval.
@@ -1711,19 +2448,7 @@ impl App {
             self.rt.alerts.lock().unwrap().clear();
         }
         if save {
-            let sec = self.secstate.sec.clone();
-            let ctx = ui.ctx().clone();
-            self.bg(&ctx, move |rt| {
-                let r = store::load().and_then(|mut c| {
-                    c.security = sec;
-                    store::save(&c)
-                });
-                let _ = rt.reload();
-                match r {
-                    Ok(()) => Event::SecuritySaved,
-                    Err(e) => Event::Msg(format!("{e:#}"), true),
-                }
-            });
+            self.save_security(&ui.ctx().clone());
         }
     }
 
@@ -1734,6 +2459,9 @@ impl App {
             if busy > 0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_close = true;
+            } else if self.dirty().is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.leave = Some(Nav::Quit);
             }
         }
         if !self.confirm_close {
@@ -1771,8 +2499,8 @@ impl App {
                         self.confirm_close = false;
                     }
                     if ui.button(RichText::new("Close anyway").color(RED)).clicked() {
-                        self.closing = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.confirm_close = false;
+                        self.nav(ctx, Nav::Quit);
                     }
                 });
             });
@@ -1883,6 +2611,13 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl App {
+    /// One frame of the whole window.
+    fn frame(&mut self, ctx: &egui::Context) {
         self.drain_events(ctx);
         self.close_guard(ctx);
         let unseen = self.rt.alerts_unseen.load(std::sync::atomic::Ordering::Relaxed);
@@ -1912,6 +2647,8 @@ impl eframe::App for App {
             }
         }
         self.browser_window(ctx);
+        self.unsaved_dialog(ctx);
+        self.clear_dialog(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
@@ -2232,4 +2969,99 @@ mod tests {
         }
         h.render().unwrap().save(out("folders.png")).unwrap();
     }
+
+    /// The real window (App::frame) for setup, validation and the dialogs.
+    #[test]
+    #[ignore]
+    fn render_preview_v5() {
+        let dir = std::env::temp_dir().join(format!("ccc-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("CCC_DIR", &dir);
+        std::env::set_var("CCC_SECRETS", "file");
+        let tokio = tokio::runtime::Runtime::new().unwrap();
+        let rt = {
+            let _g = tokio.enter();
+            let rt = Runtime::new(false);
+            rt.reload().unwrap();
+            rt
+        };
+        let mut app = App::new(rt, tokio, false);
+        app.hub.name = "lyan-fx16".into();
+        app.hub.base.0 = "lyan-fx16".into();
+        let size = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
+        let mut h = egui_kittest::Harness::builder().with_size(size).wgpu().build_state(
+            |ctx: &egui::Context, app: &mut App| {
+                setup_style(ctx);
+                ctx.set_theme(egui::Theme::Dark);
+                app.frame(ctx)
+            },
+            app,
+        );
+        let shot = |h: &mut egui_kittest::Harness<App>, name: &str| {
+            for _ in 0..6 {
+                h.step();
+            }
+            h.render().unwrap().save(out(name)).unwrap();
+        };
+        // fresh install: the app opens on the Hub page
+        assert_eq!(h.state().tab, Tab::Hub);
+        shot(&mut h, "v5-fresh-hub.png");
+        h.state_mut().tab = Tab::Connections;
+        shot(&mut h, "v5-fresh-connections.png");
+
+        // a new connection saved with fields missing
+        let ctx = h.ctx.clone();
+        {
+            let app = h.state_mut();
+            app.open_form(None);
+            let f = app.form.as_mut().unwrap();
+            f.conn.name = "robot arm".into();
+            f.conn.user = "ubuntu".into();
+            app.save(&ctx, false);
+            let f = app.form.as_ref().unwrap();
+            assert!(f.check);
+            assert_eq!(f.scroll_to, Some("name"));
+            assert!(app.msg.0.contains("Name, Host, Password"), "{}", app.msg.0);
+        }
+        shot(&mut h, "v5-form-missing.png");
+
+        // leaving it unsaved asks first
+        h.state_mut().nav(&ctx, Nav::Tab(Tab::Hub));
+        assert_eq!(h.state().leave, Some(Nav::Tab(Tab::Hub)));
+        assert_eq!(h.state().tab, Tab::Connections);
+        shot(&mut h, "v5-unsaved.png");
+        {
+            let app = h.state_mut();
+            app.leave = None;
+            app.discard(Page::Connection);
+            assert!(app.form.is_none(), "discarding a new connection closes it");
+            app.nav(&ctx, Nav::Tab(Tab::Hub));
+            assert_eq!(app.tab, Tab::Hub, "nothing unsaved: no question");
+        }
+
+        // hub: proxy with a bad address, token missing
+        {
+            let app = h.state_mut();
+            app.hub.url = "wss://jp.example.org:22624".into();
+            app.hub.proxy.mode = ProxyMode::Manual;
+            app.hub.proxy.url = "https://127.0.0.1:7890".into();
+            app.save_hub(&ctx);
+            assert!(app.hub.check);
+            assert_eq!(app.hub.scroll_to, Some("token"));
+        }
+        shot(&mut h, "v5-hub-proxy.png");
+        // switching to Activity asks to save the hub settings
+        h.state_mut().nav(&ctx, Nav::Tab(Tab::Activity));
+        assert!(h.state().leave.is_some());
+        {
+            let app = h.state_mut();
+            app.leave = None;
+            app.discard(Page::Hub);
+            assert!(!app.hub.dirty());
+            app.clear_dlg = Some(ClearDlg { what: store::ClearWhat { connections: true, hub: true, security: false }, activity: true });
+        }
+        shot(&mut h, "v5-clear.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

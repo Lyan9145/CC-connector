@@ -146,6 +146,7 @@ pub struct Runtime {
     pub cfg: RwLock<Config>,
     secrets: RwLock<HashMap<String, Secrets>>,
     hub_token: RwLock<Option<String>>,
+    proxy_pw: RwLock<Option<String>>,
     targets: RwLock<HashMap<String, Target>>,
     pub status: Mutex<HashMap<String, MachState>>,
     pub hub_status: Mutex<String>,
@@ -201,6 +202,7 @@ impl Runtime {
             cfg: RwLock::new(Config::default()),
             secrets: Default::default(),
             hub_token: Default::default(),
+            proxy_pw: Default::default(),
             targets: Default::default(),
             status: Default::default(),
             hub_status: Mutex::new("starting".into()),
@@ -280,6 +282,17 @@ impl Runtime {
         if let Some(t) = &token {
             Redactor::add_secret(&mut pats, t);
         }
+        let proxy_pw = if cfg.proxy.user.is_empty() {
+            None
+        } else {
+            store::get_secret(store::PROXY_PW).unwrap_or_else(|e| {
+                errs.push(format!("{e:#}"));
+                None
+            })
+        };
+        if let Some(p) = &proxy_pw {
+            Redactor::add_secret(&mut pats, p);
+        }
 
         // targets: keep pooled SSH sessions whose endpoint/secrets are unchanged
         let old = self.targets.read().unwrap().clone();
@@ -327,6 +340,7 @@ impl Runtime {
         *self.targets.write().unwrap() = targets;
         *self.secrets.write().unwrap() = secrets;
         *self.hub_token.write().unwrap() = token;
+        *self.proxy_pw.write().unwrap() = proxy_pw;
         *self.cfg.write().unwrap() = cfg;
         self.reloaded.send_modify(|v| *v += 1);
         self.changed.send_modify(|v| *v += 1);
@@ -540,25 +554,41 @@ impl Runtime {
         let mut req = url.into_client_request().context("invalid hub URL")?;
         req.headers_mut().insert("authorization", format!("Bearer {token}").parse()?);
         let pin = self.cfg.read().unwrap().hub_cert.clone();
+        let proxy_cfg = self.cfg.read().unwrap().proxy.clone();
+        let proxy_pw = self.proxy_pw.read().unwrap().clone();
         let connector = (url.starts_with("wss://") && !pin.is_empty())
             .then(|| tokio_tungstenite::Connector::Rustls(crate::pin::client_config(&pin)));
-        let (ws, _) = tokio::time::timeout(
-            Duration::from_secs(20),
-            tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector),
-        )
-            .await
-            .map_err(|_| anyhow::anyhow!("connect timed out"))?
-            .map_err(|e| match e {
-                tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401 => anyhow::anyhow!("hub rejected token (401)"),
-                e => anyhow::anyhow!("{e}"),
-            })?;
+        let host = req.uri().host().unwrap_or("").trim_matches(|c| c == '[' || c == ']').to_string();
+        let port = req.uri().port_u16().unwrap_or(if url.starts_with("wss://") { 443 } else { 80 });
+        let route = crate::proxy::route_for(&proxy_cfg, proxy_pw.clone(), &host).context("proxy settings")?;
+        let ws_err = |e: tokio_tungstenite::tungstenite::Error| match e {
+            tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401 => anyhow::anyhow!("hub rejected token (401)"),
+            e => anyhow::anyhow!("{e}"),
+        };
+        let connect = async {
+            match &route {
+                None => tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector).await.map_err(ws_err),
+                Some(r) => {
+                    let stream = crate::proxy::connect(r, &host, port).await?;
+                    tokio_tungstenite::client_async_tls_with_config(req, stream, None, connector).await.map_err(ws_err)
+                }
+            }
+        };
+        let (ws, _) = tokio::time::timeout(Duration::from_secs(20), connect).await.map_err(|_| anyhow::anyhow!("connect timed out"))??;
         let (mut sink, mut stream) = ws.split();
         let name = self.cfg.read().unwrap().name.clone();
         sink.send(Message::Binary(proto::encode(&Up::Hello { name, version: proto::VERSION.into() }).into())).await?;
         sink.send(Message::Binary(proto::encode(&Up::Machines(self.machines())).into())).await?;
         let plain = url.starts_with("ws://");
         let pinned = !plain && !pin.is_empty();
-        let how = if plain { " (unencrypted ws://)" } else if pinned { " (TLS, pinned certificate)" } else { " (TLS)" };
+        let via = route.as_ref().map(|r| format!(", via {}", r.shown())).unwrap_or_default();
+        let how = if plain {
+            format!(" (unencrypted ws://{via})")
+        } else if pinned {
+            format!(" (TLS, pinned certificate{via})")
+        } else {
+            format!(" (TLS{via})")
+        };
         *self.hub_status.lock().unwrap() = format!("connected{how}");
         self.push_log(format!("hub: connected{how}"));
 
@@ -571,6 +601,7 @@ impl Runtime {
         let start_url = url.to_string();
         let start_token = token.to_string();
         let start_pin = pin.clone();
+        let start_proxy = (proxy_cfg, proxy_pw);
         loop {
             tokio::select! {
                 m = stream.next() => {
@@ -605,7 +636,8 @@ impl Runtime {
                     let url_now = self.cfg.read().unwrap().hub_url.clone();
                     let tok_now = self.hub_token.read().unwrap().clone();
                     let pin_now = self.cfg.read().unwrap().hub_cert.clone();
-                    if url_now != start_url || tok_now.as_deref() != Some(start_token.as_str()) || pin_now != start_pin {
+                    let proxy_now = (self.cfg.read().unwrap().proxy.clone(), self.proxy_pw.read().unwrap().clone());
+                    if url_now != start_url || tok_now.as_deref() != Some(start_token.as_str()) || pin_now != start_pin || proxy_now != start_proxy {
                         let _ = sink.close().await;
                         self.push_log("hub: settings changed, reconnecting".into());
                         return Ok(());
@@ -1267,6 +1299,25 @@ impl Runtime {
             }
         }
         (self.redactor.read().unwrap().result(res), true)
+    }
+
+    /// Forget statistics, the request log and security alerts.
+    pub fn clear_activity(&self) {
+        self.stats.lock().unwrap().clear();
+        self.save_stats();
+        self.log.lock().unwrap().clear();
+        self.alerts.lock().unwrap().clear();
+        self.alerts_unseen.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take back everything granted for a while or for a session.
+    pub fn revoke_all(&self) {
+        self.revoke_grants();
+        let ids: Vec<u64> = self.sessions.lock().unwrap().keys().copied().collect();
+        for id in ids {
+            self.revoke_session(id);
+        }
+        self.call_folders.lock().unwrap().clear();
     }
 
     /// Sub-folders of a folder on an SSH machine (GUI folder browser):
