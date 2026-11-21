@@ -240,7 +240,9 @@ mod tests {
         let re = regex::Regex::new(r#"(?s)\b(?:tr\(|tf!\(\s*)"((?:[^"\\]|\\.)*)""#).unwrap();
         let mut k = BTreeSet::new();
         for src in [include_str!("gui.rs"), include_str!("analytics.rs")] {
-            for c in re.captures_iter(src) {
+            // Windows checkouts may have CRLF line ends
+            let src = src.replace("\r\n", "\n");
+            for c in re.captures_iter(&src) {
                 k.insert(unescape(&c[1]));
             }
         }
