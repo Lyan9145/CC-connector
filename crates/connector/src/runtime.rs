@@ -573,7 +573,9 @@ impl Runtime {
             level = Access::Allow;
         }
         if sudo {
-            level = level.max(conn.perms.sudo);
+            // sudo can't work on the Windows machine itself: refuse without asking
+            let sudo_level = if conn.kind == Kind::Local && cfg!(windows) { Access::Deny } else { conn.perms.sudo };
+            level = level.max(sudo_level);
         }
         let refuse = |what: String| {
             self.push_log(format!("{m}: refused `{what}` (not allowed)"));
@@ -582,6 +584,10 @@ impl Runtime {
         match level {
             Access::Allow => Ok(()),
             Access::Deny if tool_level == Access::Deny => refuse(tool.name().into()),
+            Access::Deny if conn.kind == Kind::Local && cfg!(windows) => {
+                self.push_log(format!("{m}: refused `sudo` (not available on Windows)"));
+                Err("sudo is not available on Windows; run the connector as Administrator instead".into())
+            }
             Access::Deny => refuse("sudo".into()),
             Access::Ask => self.ask(m, tool, sudo, call, op).await,
         }
