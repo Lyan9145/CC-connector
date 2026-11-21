@@ -3,10 +3,12 @@
 //! Anything that touches disk, the keyring or the network runs on the tokio
 //! runtime and reports back through `events`, so the UI never blocks.
 
+use crate::analytics;
 use crate::runtime::{self, Decision, Runtime};
 use crate::store::{self, Access, Auth, Connection, Kind, Perm};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Color32, RichText, Stroke};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -44,6 +46,7 @@ enum Event {
     HubSaved,
     Paired { url: String, pinned: bool },
     Test(String),
+    Retried { name: String, result: String },
 }
 
 struct App {
@@ -58,6 +61,11 @@ struct App {
     events: Arc<Mutex<Vec<Event>>>,
     /// highest approval id we already asked the OS to flash the window for
     seen_approval: u64,
+    /// connections being re-probed after a click on their dot
+    retrying: HashSet<String>,
+    page: analytics::PageState,
+    /// fake statistics for `ccc preview` (design review without real data)
+    demo: Option<crate::stats::Stats>,
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -66,6 +74,11 @@ const RED: Color32 = Color32::from_rgb(218, 54, 51);
 const GREY: Color32 = Color32::from_rgb(130, 130, 130);
 
 pub fn run() -> Result<()> {
+    run_with(false)
+}
+
+/// `preview`: show the Activity page with generated statistics.
+pub fn run_with(preview: bool) -> Result<()> {
     #[cfg(windows)]
     detach_console();
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -96,8 +109,12 @@ pub fn run() -> Result<()> {
         busy: false,
         events: Default::default(),
         seen_approval: 0,
+        retrying: HashSet::new(),
+        page: Default::default(),
+        demo: preview.then(crate::stats::demo),
     };
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([880.0, 620.0]).with_title("CC-connector");
+    let app = App { tab: if preview { Tab::Activity } else { app.tab }, ..app };
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1040.0, 760.0]).with_title("CC-connector");
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(Arc::new(icon));
     }
@@ -117,7 +134,7 @@ pub fn run() -> Result<()> {
 }
 
 /// Higher-contrast text than egui's defaults, in both themes.
-fn setup_style(ctx: &egui::Context) {
+pub(crate) fn setup_style(ctx: &egui::Context) {
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         let w = &mut s.visuals.widgets;
         w.noninteractive.fg_stroke.color = Color32::from_gray(226);
@@ -170,12 +187,87 @@ fn dot(ui: &mut egui::Ui, c: Color32) {
     ui.painter().circle_filled(rect.center(), 5.0, c);
 }
 
+/// Circular "retry" arrow (drawn, no font glyph needed).
+fn retry_icon(p: &egui::Painter, c: egui::Pos2, r: f32, col: Color32, rot: f32) {
+    let n = 20;
+    let (a0, a1) = (rot + 0.5, rot + 0.5 + std::f32::consts::TAU * 0.78);
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = a0 + (a1 - a0) * i as f32 / n as f32;
+            c + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    let end = *pts.last().unwrap();
+    p.add(egui::Shape::line(pts, Stroke::new(1.8_f32, col)));
+    // arrow head, tangent at the end of the arc
+    let t = egui::vec2(-(a1).sin(), (a1).cos());
+    let nrm = egui::vec2(a1.cos(), a1.sin());
+    let tip = end + t * 3.2;
+    p.add(egui::Shape::convex_polygon(vec![tip, end - nrm * 3.0, end + nrm * 3.0], col, Stroke::NONE));
+}
+
+/// Status dot for a connection. When `retryable` it is a button: on hover it
+/// grows into a retry arrow with a halo; while `spinning` the arrow rotates.
+fn status_dot(ui: &mut egui::Ui, col: Color32, retryable: bool, spinning: bool) -> egui::Response {
+    let sense = if retryable && !spinning { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), sense);
+    let h = ui.ctx().animate_bool_responsive(resp.id, retryable && resp.hovered());
+    let p = ui.painter();
+    let c = rect.center();
+    if spinning {
+        let t = ui.input(|i| i.time) as f32;
+        retry_icon(p, c, 5.5, AMBER, t * 6.0);
+        ui.ctx().request_repaint();
+    } else if h > 0.01 {
+        p.circle_filled(c, 5.0 + 4.5 * h, col.gamma_multiply(0.32 * h));
+        p.circle_filled(c, 5.0 * (1.0 - h), col);
+        retry_icon(p, c, 5.5 * h, col, -1.2 * (1.0 - h));
+    } else {
+        p.circle_filled(c, 5.0, col);
+    }
+    if retryable && !spinning {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// iOS-style switch; the knob slides and the track glows on hover.
+fn toggle(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let size = egui::vec2(34.0, 18.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let t = ui.ctx().animate_bool_responsive(resp.id, on);
+    let h = ui.ctx().animate_bool_responsive(resp.id.with("hover"), resp.hovered());
+    let p = ui.painter();
+    let off_col = if ui.visuals().dark_mode { Color32::from_gray(80) } else { Color32::from_gray(190) };
+    let track = lerp_col(off_col, GREEN, t);
+    if h > 0.01 {
+        p.rect_filled(rect.expand(3.5 * h), egui::CornerRadius::same(12), track.gamma_multiply(0.38 * h));
+    }
+    p.rect_filled(rect, egui::CornerRadius::same(9), track);
+    let r = 7.0 + 1.0 * h;
+    let x = egui::lerp((rect.left() + 9.0)..=(rect.right() - 9.0), t);
+    p.circle_filled(egui::pos2(x, rect.center().y + 0.5), r, Color32::from_black_alpha(40));
+    p.circle_filled(egui::pos2(x, rect.center().y), r, Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 /// A rounded, coloured status pill with white text.
-fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
+fn badge(ui: &mut egui::Ui, text: &str, fill: Color32, clickable: bool) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(12.5), Color32::WHITE);
     let size = galley.size() + egui::vec2(22.0, 8.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, if clickable { egui::Sense::click() } else { egui::Sense::hover() });
+    let h = ui.ctx().animate_bool_responsive(resp.id, clickable && resp.hovered());
     let p = ui.painter();
+    if h > 0.01 {
+        p.rect_filled(rect.expand(3.0 * h), egui::CornerRadius::same((size.y / 2.0 + 3.0) as u8), fill.gamma_multiply(0.25 * h));
+    }
+    let fill = lerp_col(fill, Color32::WHITE, 0.12 * h);
     p.rect_filled(rect, egui::CornerRadius::same((size.y / 2.0) as u8), fill);
     p.circle_filled(egui::pos2(rect.left() + 9.0, rect.center().y), 3.0, Color32::WHITE);
     p.galley(egui::pos2(rect.left() + 15.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
@@ -315,6 +407,11 @@ impl App {
                     self.busy = false;
                     self.test = Some(r);
                 }
+                Event::Retried { name, result } => {
+                    self.retrying.remove(&name);
+                    let err = !result.starts_with("online");
+                    self.msg = (format!("{name}: {result}"), err);
+                }
             }
         }
     }
@@ -421,6 +518,39 @@ impl App {
         });
     }
 
+    /// Re-probe a connection that failed (click on its dot).
+    fn retry(&mut self, ctx: &egui::Context, name: String) {
+        self.retrying.insert(name.clone());
+        let ev = self.events.clone();
+        let rt = self.rt.clone();
+        let ctx = ctx.clone();
+        self.tokio.spawn(async move {
+            let result = rt.retry(&name).await;
+            Self::push(&ev, Event::Retried { name, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Flip "visible to the agent" from the list's switch.
+    fn set_visible(&mut self, ctx: &egui::Context, name: String, on: bool) {
+        if let Some(f) = self.form.as_mut().filter(|f| f.orig == name) {
+            f.conn.enabled = on;
+        }
+        self.bg(ctx, move |rt| {
+            let r = store::load().and_then(|mut c| {
+                if let Some(x) = c.get_mut(&name) {
+                    x.enabled = on;
+                }
+                store::save(&c)
+            });
+            let _ = rt.reload();
+            match r {
+                Ok(()) => Event::Msg(format!("'{name}' is now {}", if on { "visible to the agent" } else { "hidden from the agent" }), false),
+                Err(e) => Event::Msg(format!("{e:#}"), true),
+            }
+        });
+    }
+
     fn top(&mut self, ui: &mut egui::Ui) {
         let hs = self.rt.hub_status.lock().unwrap().clone();
         let paused_now = self.rt.cfg.read().unwrap().paused;
@@ -434,7 +564,15 @@ impl App {
             } else {
                 ("OFFLINE", RED)
             };
-            badge(ui, label, col).on_hover_text(format!("hub: {hs}"));
+            let offline = label == "OFFLINE";
+            let b = badge(ui, label, col, offline);
+            if offline {
+                if b.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("hub: {hs}\nClick to reconnect now")).clicked() {
+                    self.rt.reconnect_hub();
+                }
+            } else {
+                b.on_hover_text(format!("hub: {hs}"));
+            }
             let name = self.rt.cfg.read().unwrap().name.clone();
             ui.label(RichText::new(name).strong().size(15.0));
             let detail = hs.strip_prefix("disconnected: ").unwrap_or(&hs);
@@ -499,15 +637,33 @@ impl App {
                         } else {
                             st.get(&c.name).map(|m| m.status.clone()).unwrap_or_else(|| "connecting".into())
                         };
-                        dot(ui, status_color(&s));
+                        let failed = c.enabled && c.kind == Kind::Ssh && status_color(&s) == RED;
+                        let spinning = self.retrying.contains(&c.name);
+                        let d = status_dot(ui, status_color(&s), failed, spinning);
+                        let d = if failed { d.on_hover_text(format!("{s}\nClick to retry")) } else { d.on_hover_text(&s) };
+                        if d.clicked() {
+                            self.retry(ctx, c.name.clone());
+                        }
                         let sel = self.form.as_ref().is_some_and(|f| f.orig == c.name);
                         let kind = if c.kind == Kind::Local { "  (this computer)" } else { "" };
                         let text = RichText::new(format!("{}{kind}", c.name)).size(14.0);
                         let tip = format!("{s}\naccess: {}", c.perms.summary());
-                        if ui.selectable_label(sel, text).on_hover_text(tip).clicked() {
-                            let n = c.name.clone();
-                            self.open_form(Some(&n));
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let tg = toggle(ui, c.enabled).on_hover_text(if c.enabled {
+                                "Visible to the agent (click to hide)"
+                            } else {
+                                "Hidden from the agent (click to show)"
+                            });
+                            if tg.clicked() {
+                                self.set_visible(ctx, c.name.clone(), !c.enabled);
+                            }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                if ui.selectable_label(sel, text).on_hover_text(tip).clicked() {
+                                    let n = c.name.clone();
+                                    self.open_form(Some(&n));
+                                }
+                            });
+                        });
                     });
                 }
                 if cfg.connections.is_empty() {
@@ -849,36 +1005,73 @@ impl App {
     }
 
     fn activity(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Activity");
-            if ui.small_button("Clear").clicked() {
-                self.rt.log.lock().unwrap().clear();
-            }
-        });
-        ui.label("Every request the agent makes is listed here.");
         let grants = self.rt.active_grants();
-        if !grants.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Temporarily allowed:").color(AMBER));
-                for (m, t, sudo, left) in &grants {
-                    ui.label(format!("{} on {m} ({} min)", if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() }, left.as_secs() / 60 + 1));
-                }
-                if ui.small_button("Revoke").clicked() {
-                    self.rt.revoke_grants();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Activity");
+                if self.demo.is_some() {
+                    ui.label(RichText::new("PREVIEW: generated sample data").color(AMBER).strong());
                 }
             });
-        }
-        ui.separator();
-        let lines: Vec<String> = self.rt.log.lock().unwrap().iter().cloned().collect();
-        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            for l in lines {
-                ui.label(RichText::new(l).monospace());
+            if !grants.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Temporarily allowed:").color(AMBER));
+                    for (m, t, sudo, left) in &grants {
+                        ui.label(format!(
+                            "{} on {m} ({} min)",
+                            if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() },
+                            left.as_secs() / 60 + 1
+                        ));
+                    }
+                    if ui.small_button("Revoke").clicked() {
+                        self.rt.revoke_grants();
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            let status: std::collections::HashMap<String, String> = {
+                let cfg = self.rt.cfg.read().unwrap();
+                let st = self.rt.status.lock().unwrap();
+                cfg.connections
+                    .iter()
+                    .map(|c| {
+                        let s = if !c.enabled {
+                            "disabled".into()
+                        } else {
+                            st.get(&c.name).map(|m| m.status.clone()).unwrap_or_else(|| "connecting".into())
+                        };
+                        (c.name.clone(), s)
+                    })
+                    .collect()
+            };
+            let log: Vec<String> = self.rt.log.lock().unwrap().iter().cloned().collect();
+            let inp = analytics::Inputs { status: &status, log: &log, now: crate::stats::now_secs() };
+            let action = match &self.demo {
+                Some(d) => analytics::page(ui, &mut self.page, d, &inp),
+                None => {
+                    let stats = self.rt.stats.lock().unwrap();
+                    analytics::page(ui, &mut self.page, &stats, &inp)
+                }
+            };
+            if let Some(analytics::Action::ClearStats) = action {
+                match &mut self.demo {
+                    Some(d) => d.clear(),
+                    None => {
+                        self.rt.stats.lock().unwrap().clear();
+                        self.rt.save_stats();
+                    }
+                }
+                self.msg = ("statistics cleared".into(), false);
             }
         });
     }
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.rt.save_stats();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -897,5 +1090,135 @@ impl eframe::App for App {
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    fn out(name: &str) -> std::path::PathBuf {
+        let d = std::env::var("CCC_RENDER_DIR").unwrap_or_else(|_| "/tmp/ccc-render".into());
+        std::fs::create_dir_all(&d).unwrap();
+        std::path::Path::new(&d).join(name)
+    }
+
+    fn sample_log() -> Vec<String> {
+        [
+            "14:02:11 robot: exec colcon build --symlink-install",
+            "14:02:58 robot: read ~/ros_ws/src/arm/config/limits.yaml",
+            "14:03:20 robot: waiting for your approval (`edit`)",
+            "14:03:24 robot: you approved `edit`",
+            "14:03:24 robot: edit ~/ros_ws/src/arm/config/limits.yaml",
+            "14:05:02 Fx16: exec Get-Process | Sort CPU -desc | Select -First 5",
+            "14:06:40 Fx16_WLS: exec [sudo] apt-get install -y htop",
+            "14:07:10 lab-pc: refused `exec` (not allowed)",
+            "14:09:31 robot: job start ros2 bag record -a",
+            "14:12:44 Fx16_WLS: error: No such file or directory",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Renders the Activity page (demo data) and the connection list hover
+    /// states to PNGs for design review:
+    /// `cargo test -p ccc --release render_preview -- --ignored`
+    #[test]
+    #[ignore]
+    fn render_preview() {
+        let stats = Rc::new(crate::stats::demo());
+        let status: HashMap<String, String> = [
+            ("robot", "online"),
+            ("Fx16", "online"),
+            ("Fx16_WLS", "online"),
+            ("lab-pc", "error: connect timed out"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let status = Rc::new(status);
+        let log = Rc::new(sample_log());
+        for (dark, name) in [(true, "activity-dark.png"), (false, "activity-light.png")] {
+            let (stats, status, log) = (stats.clone(), status.clone(), log.clone());
+            let mut st = analytics::PageState::default();
+            st.range = crate::stats::Range::Week;
+            let mut first = true;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1040.0, 1180.0)).wgpu().build_ui(move |ui| {
+                if first {
+                    setup_style(ui.ctx());
+                    ui.ctx().set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
+                    first = false;
+                }
+                ui.heading("Activity");
+                let inp = analytics::Inputs { status: &status, log: &log, now: crate::stats::now_secs() };
+                analytics::page(ui, &mut st, &stats, &inp);
+            });
+            for _ in 0..4 {
+                h.step();
+            }
+            // hover one column to show the tooltip
+            h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(700.0, 330.0)));
+            for _ in 0..10 {
+                h.step();
+            }
+            h.render().unwrap().save(out(name)).unwrap();
+        }
+
+        // connection list: normal, hovered failed dot, hovered toggle, retrying
+        let rects: Rc<RefCell<Vec<egui::Rect>>> = Default::default();
+        for (dark, hover, name) in [
+            (true, None, "list-normal.png"),
+            (true, Some(0usize), "list-hover-dot.png"),
+            (true, Some(1usize), "list-hover-toggle.png"),
+            (true, Some(9usize), "list-retrying.png"),
+            (false, Some(0usize), "list-hover-dot-light.png"),
+        ] {
+            let r2 = rects.clone();
+            let mut first = true;
+            let spinning = hover == Some(9);
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(300.0, 200.0)).wgpu().build_ui(move |ui| {
+                if first {
+                    setup_style(ui.ctx());
+                    ui.ctx().set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
+                    first = false;
+                }
+                let mut rs = vec![];
+                for (n, col, failed, on) in [
+                    ("lab-pc", RED, true, true),
+                    ("robot", GREEN, false, true),
+                    ("Fx16  (this computer)", GREEN, false, true),
+                    ("old-nuc", GREY, false, false),
+                ] {
+                    ui.horizontal(|ui| {
+                        let d = status_dot(ui, col, failed, spinning && failed);
+                        rs.push(d.rect);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let t = toggle(ui, on);
+                            rs.push(t.rect);
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                let _ = ui.selectable_label(false, RichText::new(n).size(14.0));
+                            });
+                        });
+                    });
+                }
+                *r2.borrow_mut() = rs;
+            });
+            for _ in 0..3 {
+                h.step();
+            }
+            if let Some(i) = hover.filter(|i| *i < 9) {
+                // 0 = first dot, 1 = first toggle
+                let c = rects.borrow()[i].center();
+                h.input_mut().events.push(egui::Event::PointerMoved(c));
+            }
+            for _ in 0..20 {
+                h.step();
+            }
+            h.render().unwrap().save(out(name)).unwrap();
+        }
     }
 }

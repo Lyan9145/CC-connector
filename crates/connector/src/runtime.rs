@@ -4,6 +4,7 @@
 use crate::exec::{local, ssh::{KeyCallback, SshTarget}};
 use crate::ops::{self, Ctx, Target};
 use crate::redact::Redactor;
+use crate::stats::{Outcome, Stats};
 use crate::store::{self, Access, Config, Connection, Kind, Perm, Secrets, Tool};
 use anyhow::{Context, Result};
 use ccc_proto::{self as proto, Down, JobOp, MachineInfo, Op, Up};
@@ -72,6 +73,10 @@ pub struct Runtime {
     /// agent tool call id -> (allowed, decided at); later ops of the same
     /// call (push/pull chunks) reuse the decision
     calls: Mutex<HashMap<u64, (bool, Instant)>>,
+    /// usage statistics (persisted to stats.json)
+    pub stats: Mutex<Stats>,
+    /// wakes the hub link to reconnect immediately
+    kick: tokio::sync::Notify,
 }
 
 fn mtime() -> Option<SystemTime> {
@@ -99,6 +104,8 @@ impl Runtime {
             next_approval: AtomicU64::new(1),
             grants: Default::default(),
             calls: Default::default(),
+            stats: Mutex::new(Stats::load()),
+            kick: tokio::sync::Notify::new(),
         });
         if let Err(e) = rt.reload() {
             rt.push_log(format!("config error: {e:#}"));
@@ -339,6 +346,25 @@ impl Runtime {
                 }
             }
         });
+        // availability samples (once a minute) and periodic statistics save
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let names: Vec<String> = me.cfg.read().unwrap().connections.iter().filter(|c| c.enabled).map(|c| c.name.clone()).collect();
+                let st = me.status.lock().unwrap().clone();
+                {
+                    let mut stats = me.stats.lock().unwrap();
+                    for n in names {
+                        stats.sample(&n, st.get(&n).is_some_and(|s| s.status.starts_with("online")));
+                    }
+                }
+                let me2 = me.clone();
+                let _ = tokio::task::spawn_blocking(move || me2.save_stats()).await;
+            }
+        });
         // hub link
         let me = self.clone();
         tokio::spawn(async move { me.link_loop().await });
@@ -368,10 +394,13 @@ impl Runtime {
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => backoff = (backoff * 2).min(30),
                 _ = reload_rx.changed() => {}
+                _ = self.kick.notified() => {
+                    backoff = 1;
+                    *self.hub_status.lock().unwrap() = "connecting".into();
+                }
             }
-            backoff = (backoff * 2).min(30);
         }
     }
 
@@ -605,6 +634,7 @@ impl Runtime {
         };
         let ok = matches!(d, Some(Decision::Once | Decision::For(_)));
         self.calls.lock().unwrap().insert(call, (ok, Instant::now()));
+        self.stats.lock().unwrap().asked(m, ok);
         match d {
             Some(Decision::Once) => {
                 self.push_log(format!("{m}: you approved {what}"));
@@ -660,6 +690,34 @@ impl Runtime {
     }
 
     pub async fn handle(&self, machine: &str, op: Op, tool: Tool, call: u64) -> ccc_proto::OpResult {
+        let up = match &op {
+            Op::WriteChunk { data, .. } => data.len() as u64,
+            _ => 0,
+        };
+        let started = Instant::now();
+        let (res, ran) = self.handle_inner(machine, op, tool, call).await;
+        let outcome = match (&res, ran) {
+            // a command that exits non-zero or times out counts as failed
+            (Ok(ccc_proto::OpOk::Exec { code, timed_out, .. }), _) if *timed_out || *code != Some(0) => Outcome::Failed,
+            (Ok(_), _) => Outcome::Ok,
+            (Err(_), true) => Outcome::Failed,
+            (Err(_), false) => Outcome::Refused,
+        };
+        let down = match &res {
+            Ok(ccc_proto::OpOk::Bytes(b)) => b.len() as u64,
+            _ => 0,
+        };
+        let ms = ran.then(|| started.elapsed().as_millis() as u64);
+        let known = self.cfg.read().unwrap().get(machine).is_some();
+        if known {
+            self.stats.lock().unwrap().record(machine, tool, call, outcome, ms, up, down);
+        }
+        res
+    }
+
+    /// Returns the result and whether the op actually ran (false = refused
+    /// by permissions, pause or an unknown machine).
+    async fn handle_inner(&self, machine: &str, op: Op, tool: Tool, call: u64) -> (ccc_proto::OpResult, bool) {
         if let Some(s) = Self::summarize(&op) {
             self.push_log(format!("{machine}: {s}"));
         }
@@ -668,15 +726,17 @@ impl Runtime {
             (cfg.get(machine).filter(|c| c.enabled).cloned(), cfg.paused)
         };
         if paused {
-            return Err("connector is paused by its user".into());
+            return (Err("connector is paused by its user".into()), false);
         }
         let (Some(conn), Some(target)) = (conn, self.target(machine)) else {
-            return Err(format!("machine '{machine}' is not available"));
+            return (Err(format!("machine '{machine}' is not available")), false);
         };
-        self.authorize(&conn, tool, call, &op).await?;
+        if let Err(e) = self.authorize(&conn, tool, call, &op).await {
+            return (Err(e), false);
+        }
         // the owner may have paused or changed permissions while we waited
         if self.cfg.read().unwrap().paused {
-            return Err("connector is paused by its user".into());
+            return (Err("connector is paused by its user".into()), false);
         }
         let secrets = self.secrets.read().unwrap().get(machine).cloned().unwrap_or_default();
         let ctx = Ctx { target: &target, conn: &conn, secrets: &secrets };
@@ -695,7 +755,31 @@ impl Runtime {
                 self.set_status(machine, "online".into(), None);
             }
         }
-        self.redactor.read().unwrap().result(res)
+        (self.redactor.read().unwrap().result(res), true)
+    }
+
+    /// Retry a connection now (GUI: click on a failed dot).
+    pub async fn retry(&self, name: &str) -> String {
+        self.set_status(name, "connecting".into(), None);
+        self.push_log(format!("{name}: retrying connection"));
+        let r = self.probe(name).await;
+        self.push_log(format!("{name}: {r}"));
+        r
+    }
+
+    /// Reconnect to the hub now instead of waiting for the retry backoff.
+    pub fn reconnect_hub(&self) {
+        self.kick.notify_one();
+    }
+
+    pub fn save_stats(&self) {
+        let mut st = self.stats.lock().unwrap();
+        if st.dirty {
+            if let Err(e) = st.save() {
+                drop(st);
+                self.push_log(format!("could not save statistics: {e:#}"));
+            }
+        }
     }
 }
 

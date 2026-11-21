@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Token {
     pub name: String,
     /// hex sha256 of the token string
@@ -78,14 +78,12 @@ impl HubConfig {
         socket_path_for(&self.socket)
     }
 
-    /// Returns the token name if `token` matches a configured token.
-    pub fn check_token(&self, token: &str) -> Option<String> {
-        let h = hash(token);
-        self.tokens
-            .iter()
-            .find(|t| ct_eq(t.sha256.as_bytes(), h.as_bytes()))
-            .map(|t| t.name.clone())
-    }
+}
+
+/// The configured token matching `token`, if any.
+pub fn check_token(tokens: &[Token], token: &str) -> Option<Token> {
+    let h = hash(token);
+    tokens.iter().find(|t| ct_eq(t.sha256.as_bytes(), h.as_bytes())).cloned()
 }
 
 pub fn socket_path_for(configured: &str) -> PathBuf {

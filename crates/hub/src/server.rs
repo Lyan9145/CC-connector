@@ -1,7 +1,7 @@
 //! Hub daemon: accepts connector WebSockets and serves local IPC requests
 //! from the MCP shim, routing them to the right connector.
 
-use crate::config::HubConfig;
+use crate::config::{self, HubConfig, Token};
 use anyhow::{Context, Result};
 use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Tool, Up};
 use futures_util::{SinkExt, StreamExt};
@@ -18,12 +18,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 struct Conn {
     name: String,
+    /// the token this connector authenticated with
+    token: Token,
     tx: mpsc::UnboundedSender<Down>,
     machines: Vec<MachineInfo>,
 }
 
 #[derive(Default)]
 struct Hub {
+    /// accepted tokens; reloaded from hub.toml while running
+    tokens: std::sync::RwLock<Vec<Token>>,
     conns: Mutex<HashMap<u64, Conn>>,
     pending: Mutex<HashMap<u64, (u64, oneshot::Sender<OpResult>)>>,
     next: AtomicU64,
@@ -85,6 +89,25 @@ impl Hub {
         }
     }
 
+    /// Apply a changed token list: new tokens work at once, connectors whose
+    /// token was revoked or replaced are disconnected.
+    fn set_tokens(&self, tokens: Vec<Token>) {
+        let gone: Vec<(u64, String, String)> = self
+            .conns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| !tokens.contains(&c.token))
+            .map(|(id, c)| (*id, c.name.clone(), c.token.name.clone()))
+            .collect();
+        eprintln!("tokens reloaded ({} configured)", tokens.len());
+        *self.tokens.write().unwrap() = tokens;
+        for (cid, name, tok) in gone {
+            eprintln!("disconnecting '{name}': token '{tok}' was revoked or replaced");
+            self.drop_conn(cid);
+        }
+    }
+
     fn drop_conn(&self, cid: u64) {
         if let Some(c) = self.conns.lock().unwrap().remove(&cid) {
             eprintln!("connector '{}' disconnected", c.name);
@@ -102,7 +125,28 @@ impl Hub {
 pub async fn serve(cfg: HubConfig) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let hub = Arc::new(Hub::default());
+    *hub.tokens.write().unwrap() = cfg.tokens.clone();
     let cfg = Arc::new(cfg);
+
+    // Reload tokens when hub.toml changes (`ccc-hub token new/pair/revoke`).
+    let h = hub.clone();
+    tokio::spawn(async move {
+        let mtime = || std::fs::metadata(config::path()).and_then(|m| m.modified()).ok();
+        let mut last = mtime();
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let now = mtime();
+            if now == last {
+                continue;
+            }
+            last = now;
+            match HubConfig::load() {
+                Ok(c) if *h.tokens.read().unwrap() != c.tokens => h.set_tokens(c.tokens),
+                Ok(_) => {}
+                Err(e) => eprintln!("hub.toml changed but could not be read: {e:#}"),
+            }
+        }
+    });
 
     // Local IPC for the MCP shim.
     let sock = cfg.socket_path();
@@ -139,7 +183,7 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
     } else {
         None
     };
-    if cfg.tokens.is_empty() {
+    if hub.tokens.read().unwrap().is_empty() {
         eprintln!("warning: no tokens configured; create one with `ccc-hub token new <name>`");
     }
     let listener = TcpListener::bind(&cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?;
@@ -151,15 +195,14 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
         let (tcp, _) = listener.accept().await?;
         let _ = tcp.set_nodelay(true);
         let hub = hub.clone();
-        let cfg = cfg.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
             let r = match tls {
                 Some(acc) => match acc.accept(tcp).await {
-                    Ok(s) => handle(hub, cfg, s).await,
+                    Ok(s) => handle(hub, s).await,
                     Err(e) => Err(e.into()),
                 },
-                None => handle(hub, cfg, tcp).await,
+                None => handle(hub, tcp).await,
             };
             if let Err(e) = r {
                 eprintln!("connection ended: {e:#}");
@@ -177,7 +220,7 @@ fn load_tls(cert: &str, key: &str) -> Result<rustls::ServerConfig> {
 }
 
 #[allow(clippy::result_large_err)]
-async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub>, cfg: Arc<HubConfig>, stream: S) -> Result<()> {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub>, stream: S) -> Result<()> {
     let mut token_name = None;
     let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
         let tok = req
@@ -186,9 +229,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
-        match cfg.check_token(tok) {
-            Some(n) => {
-                token_name = Some(n);
+        match config::check_token(&hub.tokens.read().unwrap(), tok) {
+            Some(t) => {
+                token_name = Some(t);
                 Ok(resp)
             }
             None => {
@@ -200,7 +243,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub
     })
     .await
     .context("handshake")?;
-    let token_name = token_name.unwrap_or_default();
+    let Some(token) = token_name else { return Ok(()) };
+    let token_name = token.name.clone();
     let (mut sink, mut stream) = ws.split();
 
     // First message must be Hello.
@@ -233,7 +277,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub
         let mut conns = hub.conns.lock().unwrap();
         // A reconnect replaces the stale session of the same connector.
         conns.retain(|_, c| c.name != name);
-        conns.insert(cid, Conn { name: name.clone(), tx: tx.clone(), machines: vec![] });
+        conns.insert(cid, Conn { name: name.clone(), token, tx: tx.clone(), machines: vec![] });
     }
     let _ = tx.send(Down::Welcome { version: proto::VERSION.into() });
     drop(tx); // the registry holds the only sender; removing it closes the writer

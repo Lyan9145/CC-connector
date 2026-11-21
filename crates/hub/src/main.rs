@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
                     cfg.save()?;
                     println!("token: {t}");
                     print_pairing(&cfg, &t);
-                    eprintln!("token '{name}' created (shown only once). Restart the hub to apply: systemctl restart ccc-hub");
+                    eprintln!("token '{name}' created (shown only once). A running hub picks it up within a few seconds.");
                 }
                 TokenCmd::Pair { name } => {
                     let t = config::new_token();
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
                     cfg.save()?;
                     println!("token: {t}");
                     print_pairing(&cfg, &t);
-                    eprintln!("token '{name}' replaced; the old one stops working after: systemctl restart ccc-hub");
+                    eprintln!("token '{name}' replaced; a running hub disconnects the old one within a few seconds.");
                 }
                 TokenCmd::List => {
                     for t in &cfg.tokens {
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
                         bail!("no token '{name}'");
                     }
                     cfg.save()?;
-                    eprintln!("revoked; restart `ccc-hub serve` to apply");
+                    eprintln!("revoked; a running hub disconnects connectors using it within a few seconds.");
                 }
             }
             Ok(())
@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
                     cfg.save()?;
                     println!("self-signed certificate for {} created", names.join(", "));
                     println!("fingerprint: {}", fingerprint(&cfg).unwrap_or_default());
-                    println!("restart the hub (systemctl restart ccc-hub), then pair connectors with `ccc-hub token pair <name>`");
+                    println!("restart the hub (systemctl restart ccc-hub) to load the certificate, then pair connectors with `ccc-hub token pair <name>`");
                 }
                 TlsCmd::Off => {
                     cfg.tls_cert.clear();

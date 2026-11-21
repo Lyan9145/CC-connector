@@ -32,6 +32,9 @@ hex.workspace = true
 serde_json.workspace = true
 eframe = { version = "0.33", optional = true }
 
+[dev-dependencies]
+egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }
+
 [build-dependencies]
 winresource = "0.1"
 

@@ -61,7 +61,6 @@ ccc-hub print-systemd > /etc/systemd/system/ccc-hub.service
 systemctl daemon-reload && systemctl enable --now ccc-hub
 
 ccc-hub token new laptop                      # prints a PAIRING CODE (ccc1:…), shown once
-systemctl restart ccc-hub                     # tokens are loaded at start
 
 claude mcp add remote --scope user -- /usr/local/bin/ccc-hub mcp
 ```
@@ -163,8 +162,11 @@ ccc-hub token new laptop      # create; prints the token and a pairing code (sho
 ccc-hub token pair laptop     # replace the token and print a new pairing code
 ccc-hub token list
 ccc-hub token revoke laptop
-systemctl restart ccc-hub     # required after any token change
 ```
+
+Token changes apply to the running hub within about 2 seconds, with no restart: a new token works
+at once, and a connector whose token was revoked or replaced is disconnected immediately. (Only
+`config` and `tls` changes need `systemctl restart ccc-hub`.)
 
 A **pairing code** (`ccc1:…`) is one line containing the hub URL, the token and the hub
 certificate fingerprint. Treat it like a password. The hub stores only a SHA-256 hash of each
@@ -212,7 +214,11 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 #### The window
 
 - **Connections:** your machines. The dot shows each one's status (green online, amber
-  connecting, red error, grey disabled/paused). Hover for the detail.
+  connecting, red error, grey hidden/paused); hover for the detail. A red dot is a **retry
+  button**: hover it and it turns into a retry arrow, click to reconnect now. The switch on the
+  right shows or hides the machine from the agent in one click.
+- **Top badge:** when it says **OFFLINE**, click it to reconnect to the hub immediately instead of
+  waiting for the next automatic retry.
 - **Hub:** pairing and hub status.
 - **Activity:** every request the agent makes, e.g. `14:02:11 robot: exec [sudo] apt-get update`,
   including refused ones. Temporary "allow for 15 min" grants are listed at the top with a
@@ -497,7 +503,7 @@ short for `--allow sudo` / `--deny sudo`.
 | Symptom | Fix |
 |---|---|
 | Badge **OFFLINE**, "Connection refused" or "connect timed out" | Hub not running (`systemctl status ccc-hub`), or the port is blocked by a firewall / cloud security group. |
-| "hub rejected token (401)" | Token revoked or replaced, or the hub wasn't restarted after `token new`. Issue a new code with `ccc-hub token pair NAME`, restart the hub, pair again. |
+| "hub rejected token (401)" | Token revoked or replaced. Issue a new code with `ccc-hub token pair NAME` and pair again (no hub restart needed). |
 | "hub certificate … does not match the pinned …" | The hub's certificate changed (`tls self-signed` was re-run). Pair again with a fresh code. |
 | "invalid peer certificate: UnknownIssuer" | The hub uses a self-signed certificate but the connector has no pin: pair with a pairing code instead of typing the URL. |
 | Claude says "no machines connected" | The connector isn't running or isn't paired, or *Pause agent access* is on, or all machines are hidden. |

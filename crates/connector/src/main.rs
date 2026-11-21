@@ -1,3 +1,5 @@
+#[cfg(feature = "gui")]
+mod analytics;
 mod exec;
 #[cfg(feature = "gui")]
 mod gui;
@@ -5,6 +7,7 @@ mod ops;
 mod pin;
 mod redact;
 mod runtime;
+mod stats;
 mod store;
 
 use anyhow::{bail, Context, Result};
@@ -76,6 +79,9 @@ enum Cmd {
     },
     /// Print a systemd user unit for `ccc run`.
     PrintSystemd,
+    /// Open the GUI with generated statistics on the Activity tab (design preview).
+    #[command(hide = true)]
+    Preview,
 }
 
 #[derive(Args, Default)]
@@ -256,6 +262,14 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "gui"))]
             bail!("built without GUI; use `ccc run`")
         }
+        Cmd::Preview => {
+            #[cfg(feature = "gui")]
+            {
+                gui::run_with(true)
+            }
+            #[cfg(not(feature = "gui"))]
+            bail!("built without GUI")
+        }
         Cmd::Run => {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let rt = tokio::runtime::Runtime::new()?;
@@ -267,6 +281,7 @@ fn main() -> Result<()> {
                 eprintln!("config: {}", store::config_path().display());
                 r.start();
                 tokio::signal::ctrl_c().await?;
+                r.save_stats();
                 Ok(())
             })
         }
