@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "ccc"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -879,6 +879,7 @@ dependencies = [
  "hex",
  "image",
  "keyring",
+ "libc",
  "rand 0.8.8",
  "regex",
  "rfd",
@@ -897,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "ccc-hub"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -922,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "ccc-proto"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "rmp-serde",

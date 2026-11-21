@@ -555,6 +555,7 @@ impl Runtime {
         req.headers_mut().insert("authorization", format!("Bearer {token}").parse()?);
         let pin = self.cfg.read().unwrap().hub_cert.clone();
         let proxy_cfg = self.cfg.read().unwrap().proxy.clone();
+        let iface = self.cfg.read().unwrap().hub_iface.clone();
         let proxy_pw = self.proxy_pw.read().unwrap().clone();
         let connector = (url.starts_with("wss://") && !pin.is_empty())
             .then(|| tokio_tungstenite::Connector::Rustls(crate::pin::client_config(&pin)));
@@ -567,9 +568,13 @@ impl Runtime {
         };
         let connect = async {
             match &route {
-                None => tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector).await.map_err(ws_err),
+                None if iface.is_empty() => tokio_tungstenite::connect_async_tls_with_config(req, None, true, connector).await.map_err(ws_err),
+                None => {
+                    let stream = crate::netif::connect(&host, port, &iface).await?;
+                    tokio_tungstenite::client_async_tls_with_config(req, stream, None, connector).await.map_err(ws_err)
+                }
                 Some(r) => {
-                    let stream = crate::proxy::connect(r, &host, port).await?;
+                    let stream = crate::proxy::connect(r, &host, port, &iface).await?;
                     tokio_tungstenite::client_async_tls_with_config(req, stream, None, connector).await.map_err(ws_err)
                 }
             }
@@ -581,7 +586,10 @@ impl Runtime {
         sink.send(Message::Binary(proto::encode(&Up::Machines(self.machines())).into())).await?;
         let plain = url.starts_with("ws://");
         let pinned = !plain && !pin.is_empty();
-        let via = route.as_ref().map(|r| format!(", via {}", r.shown())).unwrap_or_default();
+        let mut via = route.as_ref().map(|r| format!(", via {}", r.shown())).unwrap_or_default();
+        if !iface.is_empty() {
+            via.push_str(&format!(", adapter '{iface}'"));
+        }
         let how = if plain {
             format!(" (unencrypted ws://{via})")
         } else if pinned {
@@ -601,7 +609,7 @@ impl Runtime {
         let start_url = url.to_string();
         let start_token = token.to_string();
         let start_pin = pin.clone();
-        let start_proxy = (proxy_cfg, proxy_pw);
+        let start_proxy = (proxy_cfg, proxy_pw, iface);
         loop {
             tokio::select! {
                 m = stream.next() => {
@@ -636,7 +644,10 @@ impl Runtime {
                     let url_now = self.cfg.read().unwrap().hub_url.clone();
                     let tok_now = self.hub_token.read().unwrap().clone();
                     let pin_now = self.cfg.read().unwrap().hub_cert.clone();
-                    let proxy_now = (self.cfg.read().unwrap().proxy.clone(), self.proxy_pw.read().unwrap().clone());
+                    let proxy_now = {
+                        let c = self.cfg.read().unwrap();
+                        (c.proxy.clone(), self.proxy_pw.read().unwrap().clone(), c.hub_iface.clone())
+                    };
                     if url_now != start_url || tok_now.as_deref() != Some(start_token.as_str()) || pin_now != start_pin || proxy_now != start_proxy {
                         let _ = sink.close().await;
                         self.push_log("hub: settings changed, reconnecting".into());

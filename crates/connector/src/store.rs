@@ -270,6 +270,10 @@ pub struct Connection {
     pub folders: Vec<FolderRule>,
     /// Access outside all listed folders (Full = no folder limits).
     pub elsewhere: FolderAccess,
+    /// Network adapter to reach the host through (SSH only; empty =
+    /// automatic, i.e. the system's routing).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub iface: String,
     /// Pre-0.3 config; migrated into `perms.sudo` on load.
     #[serde(skip_serializing)]
     pub allow_sudo: Option<bool>,
@@ -293,6 +297,7 @@ impl Default for Connection {
             perms: Perms::default(),
             folders: vec![],
             elsewhere: FolderAccess::Full,
+            iface: String::new(),
             allow_sudo: None,
         }
     }
@@ -304,6 +309,7 @@ impl Connection {
         self.kind == o.kind
             && self.host == o.host
             && self.port == o.port
+            && self.iface == o.iface
             && self.user == o.user
             && self.auth == o.auth
             && self.key_path == o.key_path
@@ -445,6 +451,9 @@ pub struct Config {
     /// verify against public CAs.
     pub hub_cert: String,
     pub paused: bool,
+    /// Network adapter for the hub link (empty = automatic).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hub_iface: String,
     #[serde(skip_serializing_if = "ProxyCfg::is_off")]
     pub proxy: ProxyCfg,
     #[serde(rename = "connection")]
@@ -651,6 +660,7 @@ pub fn clear_data(w: ClearWhat) -> Result<()> {
         c.hub_url.clear();
         c.hub_cert.clear();
         c.proxy = ProxyCfg::default();
+        c.hub_iface.clear();
         c.name = hostname();
         c.paused = false;
     }

@@ -245,10 +245,10 @@ fn glob(p: &str, s: &str) -> bool {
     rest.is_empty()
 }
 
-/// Open a TCP stream to `host:port` through the proxy.
-pub async fn connect(r: &Route, host: &str, port: u16) -> Result<TcpStream> {
-    let mut s = TcpStream::connect((r.host.as_str(), r.port)).await.with_context(|| format!("can't reach the {}", r.shown()))?;
-    s.set_nodelay(true).ok();
+/// Open a TCP stream to `host:port` through the proxy (reaching the proxy
+/// through network adapter `iface`, or automatically when empty).
+pub async fn connect(r: &Route, host: &str, port: u16, iface: &str) -> Result<TcpStream> {
+    let mut s = crate::netif::connect(&r.host, r.port, iface).await.with_context(|| format!("can't reach the {}", r.shown()))?;
     match r.kind {
         Kind::Http => http_connect(&mut s, r, host, port).await?,
         Kind::Socks5 => socks5(&mut s, r, host, port).await?,
@@ -505,11 +505,11 @@ mod tests {
                 let mut r = Route { kind, host: "127.0.0.1".into(), port: pp, user: String::new(), pass: None };
                 if let Some((u, p)) = need {
                     // without a login the proxy refuses
-                    assert!(connect(&r, "localhost", target).await.is_err(), "{kind:?} needs a login");
+                    assert!(connect(&r, "localhost", target, "").await.is_err(), "{kind:?} needs a login");
                     r.user = u.into();
                     r.pass = Some(p.into());
                 }
-                let mut s = connect(&r, "localhost", target).await.unwrap();
+                let mut s = connect(&r, "localhost", target, "").await.unwrap();
                 s.write_all(b"ping").await.unwrap();
                 let mut b = [0u8; 4];
                 s.read_exact(&mut b).await.unwrap();
@@ -517,7 +517,7 @@ mod tests {
             }
         }
         let dead = Route { kind: Kind::Http, host: "127.0.0.1".into(), port: 1, user: String::new(), pass: None };
-        let e = connect(&dead, "localhost", target).await.unwrap_err();
+        let e = connect(&dead, "localhost", target, "").await.unwrap_err();
         assert!(format!("{e:#}").contains("can't reach the HTTP proxy 127.0.0.1:1"), "{e:#}");
     }
 

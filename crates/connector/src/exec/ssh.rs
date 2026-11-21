@@ -77,7 +77,12 @@ impl SshTarget {
         });
         let seen = Arc::new(Mutex::new(None));
         let handler = Client { expected: c.host_key.clone(), seen: seen.clone() };
-        let res = client::connect(cfg, (c.host.as_str(), c.port), handler).await;
+        let res = if c.iface.is_empty() {
+            client::connect(cfg, (c.host.as_str(), c.port), handler).await
+        } else {
+            let stream = crate::netif::connect(&c.host, c.port, &c.iface).await?;
+            client::connect_stream(cfg, stream, handler).await
+        };
         let fp = seen.lock().unwrap().clone();
         let mut h = match res {
             Ok(h) => h,

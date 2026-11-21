@@ -6,6 +6,7 @@ mod filters;
 mod gui;
 mod ops;
 mod paths;
+mod netif;
 mod pin;
 mod proxy;
 mod redact;
@@ -56,6 +57,9 @@ enum Cmd {
         /// User name for the proxy (empty = none); prompts for its password.
         #[arg(long)]
         proxy_user: Option<String>,
+        /// Network adapter for the hub link (see `ccc adapters`), or `auto`.
+        #[arg(long, value_name = "NAME")]
+        adapter: Option<String>,
     },
     /// Add a connection.
     Add {
@@ -89,6 +93,8 @@ enum Cmd {
     },
     /// Print a systemd user unit for `ccc run`.
     PrintSystemd,
+    /// List network adapters (names for --adapter).
+    Adapters,
     /// Security filters: list them, change what they do, or test a command.
     Security {
         #[command(subcommand)]
@@ -194,6 +200,10 @@ struct ConnArgs {
     /// Access outside the listed folders (same levels; full = no folder limits).
     #[arg(long, value_name = "LEVEL")]
     elsewhere: Option<String>,
+    /// Network adapter to reach the host through (see `ccc adapters`), or
+    /// `auto` to let the system choose.
+    #[arg(long, value_name = "NAME")]
+    adapter: Option<String>,
     /// Same as --allow sudo.
     #[arg(long)]
     sudo: bool,
@@ -220,6 +230,18 @@ fn perm_list(s: &str) -> Result<Vec<Perm>> {
         .filter(|x| !x.is_empty())
         .map(|x| Perm::parse(x).with_context(|| format!("unknown tool '{x}' (exec read write edit push pull job sudo)")))
         .collect()
+}
+
+/// `--adapter NAME|auto`: the stored adapter name ("" = automatic).
+fn adapter_arg(a: &str) -> Result<String> {
+    let a = a.trim();
+    if a.is_empty() || a.eq_ignore_ascii_case("auto") || a.eq_ignore_ascii_case("automatic") {
+        return Ok(String::new());
+    }
+    if !netif::list().iter().any(|x| x.name == a) {
+        eprintln!("warning: no network adapter named '{a}' right now (see `ccc adapters`); saved anyway");
+    }
+    Ok(a.to_string())
 }
 
 fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
@@ -282,6 +304,9 @@ fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
     }
     if let Some(l) = &o.elsewhere {
         c.elsewhere = FolderAccess::parse(l).with_context(|| format!("unknown folder level '{l}' (full, read-ask, read, ask, deny)"))?;
+    }
+    if let Some(a) = &o.adapter {
+        c.iface = adapter_arg(a)?;
     }
     if o.sudo {
         c.perms.sudo = Access::Allow;
@@ -356,7 +381,7 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Cmd::Hub { pair, url, token, token_stdin, name, proxy, proxy_user } => {
+        Cmd::Hub { pair, url, token, token_stdin, name, proxy, proxy_user, adapter } => {
             if let Some(code) = pair {
                 let p = store::apply_pairing(&code)?;
                 println!("paired with {}{}", p.url, if p.cert.is_some() { " (pinned self-signed certificate)" } else { "" });
@@ -399,6 +424,9 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            if let Some(a) = adapter {
+                c.hub_iface = adapter_arg(&a)?;
+            }
             if let Some(u) = proxy_user {
                 c.proxy.user = u.trim().to_string();
                 if c.proxy.user.is_empty() {
@@ -427,6 +455,7 @@ fn main() -> Result<()> {
             if !c.proxy.user.is_empty() {
                 println!("proxy user: {}", c.proxy.user);
             }
+            println!("adapter: {}", if c.hub_iface.is_empty() { "automatic" } else { &c.hub_iface });
             println!("config: {}", store::config_path().display());
             Ok(())
         }
@@ -524,6 +553,9 @@ fn main() -> Result<()> {
                 Kind::Local => println!("type:     this computer"),
                 Kind::Ssh => println!("type:     ssh {}@{}:{}", x.user, x.host, x.port),
             }
+            if x.kind == Kind::Ssh {
+                println!("adapter:  {}", if x.iface.is_empty() { "automatic" } else { &x.iface });
+            }
             if !x.cwd.is_empty() {
                 println!("cwd:      {}", x.cwd);
             }
@@ -574,6 +606,22 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Security { cmd } => security_cmd(cmd.unwrap_or(SecCmd::List)),
+        Cmd::Adapters => {
+            let all = netif::list();
+            if all.is_empty() {
+                println!("no network adapters found");
+            }
+            for a in all {
+                println!("{:28} {}", a.name, if a.up { "connected" } else { "not connected" });
+                for ip in a.v4.iter().map(|x| x.to_string()).chain(a.v6.iter().map(|x| x.to_string())) {
+                    println!("    {ip}");
+                }
+                if !a.desc.is_empty() && a.desc != a.name {
+                    println!("    ({})", a.desc);
+                }
+            }
+            Ok(())
+        }
         Cmd::PrintSystemd => {
             let exe = std::env::current_exe()?;
             println!(

@@ -29,7 +29,7 @@ per machine and per tool, what it may do: allow, ask you first, or deny.
 - [Quick start](#quick-start)
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub)
-  - [2. Laptop: the connector](#2-laptop-the-connector) ([proxy](#proxy), [clear data](#clear-data))
+  - [2. Laptop: the connector](#2-laptop-the-connector) ([proxy](#proxy), [network adapter](#network-adapter), [clear data](#clear-data))
   - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
 - [Agent tools reference](#agent-tools-reference)
@@ -235,6 +235,26 @@ certificate pin are end to end). When connected, the Hub status says e.g.
 CLI: `ccc hub --proxy socks5://127.0.0.1:1080`, `--proxy system`, `--proxy off`,
 `--proxy-user NAME` (prompts for the password).
 
+#### Network adapter
+
+If the laptop has several network cards, the folded **Network adapter** sections choose which
+one a connection uses: on the Hub page for the hub link (or the hop to the proxy), and in each SSH
+connection's form for that machine. **Automatic** (default) lets the system's routing decide,
+which is right in most setups. Pick an adapter when:
+
+- two networks overlap (the robot's LAN uses the same `192.168.x` range as the Wi-Fi),
+- a VPN or a proxy tool in TUN mode captures all traffic, and the robot must be reached over the
+  physical Ethernet port instead,
+- the hub link should use a particular uplink.
+
+The list shows each adapter's name, address and description; disconnected ones are greyed out.
+The choice is saved by name (addresses from DHCP change). If that adapter is unplugged or
+disconnected, the connection fails with a clear message instead of silently going another way.
+On Windows the adapter is enforced (`IP_UNICAST_IF`, no admin rights needed). On Linux it is
+enforced when the connector runs as root; otherwise the adapter's address is used and the routing
+table still decides. CLI: `ccc adapters` lists the names; `ccc hub --adapter NAME`,
+`ccc edit robot --adapter NAME`, `--adapter auto` to go back.
+
 #### Clear data
 
 **Hub** page → **Clear data** (folded, at the bottom) → **Clear data…** opens a confirmation
@@ -256,7 +276,7 @@ on.
   are pending.
 - **Closing the window** while tool calls are running (or waiting for your approval) asks first:
   closing stops the connector, so those calls fail. Background jobs keep running either way.
-- **Hub:** pairing, proxy, hub status, and *Clear data*.
+- **Hub:** pairing, proxy, network adapter, hub status, and *Clear data*.
 - **Unsaved changes:** leaving the connection form, the Hub settings or the Security tab with
   unsaved edits (switching tabs, picking another connection, closing the window) asks
   **Save / Discard changes / Cancel**.
@@ -322,6 +342,7 @@ and scrolls to the first one; the outline clears as soon as the field is fixed.
 | Agent access | Allow / Ask / Deny for each tool and for sudo, or pick a preset (see [Permissions](#permissions)). |
 | Folders | Where the file tools may go: a level per folder plus one for everywhere else (see [Folders](#folders)). **Browse…** picks a folder (the Windows folder dialog for this computer, a built-in browser for SSH machines). |
 | Host key | Trusted on first connection and pinned afterwards; *Forget* after reinstalling the machine. |
+| Network adapter | Folded, SSH only: which network card reaches this machine (default *Automatic*). See [Network adapter](#network-adapter). |
 
 **Save and test** saves, connects, reports the OS, checks that sudo works, and pins the host key.
 
@@ -619,7 +640,8 @@ process tree.
 |---|---|
 | `ccc` | open the GUI |
 | `ccc run` | run without GUI |
-| `ccc hub [--pair CODE] [--url URL] [--token] [--name NAME] [--proxy URL\|system\|off] [--proxy-user NAME]` | pair / show hub settings |
+| `ccc hub [--pair CODE] [--url URL] [--token] [--name NAME] [--proxy URL\|system\|off] [--proxy-user NAME] [--adapter NAME\|auto]` | pair / show hub settings |
+| `ccc adapters` | list network adapters (names for `--adapter`) |
 | `ccc add NAME (--local \| --host H --user U) [options]` | add a connection |
 | `ccc edit NAME [--rename NEW] [options]` | change a connection |
 | `ccc rm NAME` · `ccc list` · `ccc test NAME` | remove / list / test |
@@ -645,6 +667,7 @@ short for `--allow sudo` / `--deny sudo`.
 Folder options: `--folder LEVEL=PATH` (repeatable; levels `full`, `read-ask`, `read`, `ask`,
 `deny`; `none=PATH` removes the rule) and `--elsewhere LEVEL`, e.g.
 `ccc edit robot --folder full=~/ros_ws --folder read-ask=~ --elsewhere ask`.
+Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 
 ---
 
@@ -676,6 +699,7 @@ Folder options: `--folder LEVEL=PATH` (repeatable; levels `full`, `read-ask`, `r
 | "hub rejected token (401)" | Token revoked or replaced. Issue a new code with `ccc-hub token pair NAME` and pair again (no hub restart needed). |
 | "hub certificate … does not match the pinned …" | The hub's certificate changed (`tls self-signed` was re-run). Pair again with a fresh code. |
 | "can't reach the HTTP proxy …", "the proxy refused the connection", "the proxy needs a user name and password" | Check the **Proxy** section on the Hub page: address, type (`http://` vs `socks5://`), login. |
+| "network adapter '…' not found" / "is not connected" | The adapter chosen in a *Network adapter* section is unplugged, renamed or off. Reconnect it, or pick another one or *Automatic*. |
 | "the system proxy uses an auto-config script" | PAC files aren't supported; choose *Manual* and enter the proxy address. |
 | "invalid peer certificate: UnknownIssuer" | The hub uses a self-signed certificate but the connector has no pin: pair with a pairing code instead of typing the URL. |
 | Claude says "no machines connected" | The connector isn't running or isn't paired, or *Pause agent access* is on, or all machines are hidden. |

@@ -56,8 +56,10 @@ struct HubForm {
     proxy_pw: String,
     has_proxy_pw: bool,
     clear_proxy_pw: bool,
-    /// saved (name, url, proxy), to spot unsaved changes
-    base: (String, String, ProxyCfg),
+    /// network adapter for the hub link ("" = automatic)
+    iface: String,
+    /// saved (name, url, proxy, adapter), to spot unsaved changes
+    base: (String, String, ProxyCfg, String),
     /// what the OS proxy settings say (refreshed when "System" is picked)
     sys_proxy: String,
     check: bool,
@@ -76,7 +78,8 @@ impl HubForm {
             proxy_pw: String::new(),
             has_proxy_pw,
             clear_proxy_pw: false,
-            base: (cfg.name.clone(), cfg.hub_url.clone(), cfg.proxy.clone()),
+            iface: cfg.hub_iface.clone(),
+            base: (cfg.name.clone(), cfg.hub_url.clone(), cfg.proxy.clone(), cfg.hub_iface.clone()),
             sys_proxy: if cfg.proxy.mode == ProxyMode::System { crate::proxy::describe_system() } else { String::new() },
             check: false,
             scroll_to: None,
@@ -84,7 +87,7 @@ impl HubForm {
     }
 
     fn dirty(&self) -> bool {
-        (&self.name, &self.url, &self.proxy) != (&self.base.0, &self.base.1, &self.base.2)
+        (&self.name, &self.url, &self.proxy, &self.iface) != (&self.base.0, &self.base.1, &self.base.2, &self.base.3)
             || !self.token.trim().is_empty()
             || !self.proxy_pw.is_empty()
             || self.clear_proxy_pw
@@ -202,6 +205,8 @@ struct App {
     clear_dlg: Option<ClearDlg>,
     /// "Getting started" hidden for this run
     guide_hidden: bool,
+    /// network adapters, re-read every few seconds while shown
+    adapters: (Option<std::time::Instant>, Vec<crate::netif::Adapter>),
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -289,6 +294,7 @@ impl App {
             after_save: None,
             clear_dlg: None,
             guide_hidden: false,
+            adapters: (None, vec![]),
         }
     }
 }
@@ -996,6 +1002,60 @@ fn checked(ui: &mut egui::Ui, err: Option<&str>, scroll: bool, add: impl FnOnce(
     .inner
 }
 
+/// Folded "Network adapter" chooser. `what` names the traffic it applies to.
+fn adapter_section(ui: &mut egui::Ui, id: &str, value: &mut String, adapters: &[crate::netif::Adapter], what: &str) {
+    let found = adapters.iter().find(|a| &a.name == value);
+    let summary = match (value.is_empty(), found) {
+        (true, _) => "automatic".to_string(),
+        (false, Some(a)) if a.up => value.clone(),
+        (false, Some(_)) => format!("{value}, not connected"),
+        (false, None) => format!("{value}, not found"),
+    };
+    egui::CollapsingHeader::new(RichText::new(format!("Network adapter  ({summary})")).strong())
+        .id_salt(id)
+        .default_open(!value.is_empty())
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Which network card {what} goes through. Automatic lets the system's routing choose, which is right \
+                     unless two networks overlap or a VPN / TUN mode captures all traffic."
+                ))
+                .weak(),
+            );
+            ui.add_space(2.0);
+            let auto = "Automatic (let the system choose)";
+            let shown = if value.is_empty() {
+                auto.to_string()
+            } else {
+                found.map(|a| a.label()).unwrap_or_else(|| format!("{value} (not found)"))
+            };
+            egui::ComboBox::from_id_salt((id, "combo")).width(440.0).selected_text(shown).show_ui(ui, |ui| {
+                ui.selectable_value(value, String::new(), auto);
+                for a in adapters {
+                    let t = RichText::new(a.label());
+                    ui.selectable_value(value, a.name.clone(), if a.up { t } else { t.weak() });
+                }
+            });
+            match (value.is_empty(), found) {
+                (true, _) => {}
+                (false, Some(a)) if a.up => {
+                    if cfg!(target_os = "linux") {
+                        ui.label(
+                            RichText::new("On Linux the adapter is only enforced when the connector runs as root; otherwise its address is used and routing decides.")
+                                .weak(),
+                        );
+                    }
+                }
+                (false, Some(_)) => {
+                    ui.label(RichText::new("This adapter is not connected right now, so the connection will fail until it is.").color(AMBER));
+                }
+                (false, None) => {
+                    ui.label(RichText::new("No adapter with this name right now (unplugged, or renamed?).").color(AMBER));
+                }
+            }
+        });
+}
+
 /// Human name of a form field key, for messages.
 fn field_name(k: &str) -> &'static str {
     match k {
@@ -1112,7 +1172,7 @@ impl App {
                     h.url = h.url.trim().to_string();
                     h.proxy.url = h.proxy.url.trim().to_string();
                     h.proxy.user = h.proxy.user.trim().to_string();
-                    h.base = (h.name.clone(), h.url.clone(), h.proxy.clone());
+                    h.base = (h.name.clone(), h.url.clone(), h.proxy.clone(), h.iface.clone());
                     h.check = false;
                     self.msg = ("hub settings saved".into(), false);
                     if let Some(n) = self.after_save.take() {
@@ -1370,6 +1430,14 @@ impl App {
         });
     }
 
+    /// Network adapters (re-read at most every 3 s).
+    fn adapters(&mut self) -> Vec<crate::netif::Adapter> {
+        if self.adapters.0.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3)) {
+            self.adapters = (Some(std::time::Instant::now()), crate::netif::list());
+        }
+        self.adapters.1.clone()
+    }
+
     /// Unsaved changes, if any: which page and how to name them.
     fn dirty(&self) -> Option<(Page, String)> {
         if let Some(f) = self.form.as_ref().filter(|f| f.dirty()) {
@@ -1449,7 +1517,7 @@ impl App {
             }
             Page::Hub => {
                 let h = &mut self.hub;
-                (h.name, h.url, h.proxy) = h.base.clone();
+                (h.name, h.url, h.proxy, h.iface) = h.base.clone();
                 h.token.clear();
                 h.proxy_pw.clear();
                 h.clear_proxy_pw = false;
@@ -1694,6 +1762,7 @@ impl App {
         proxy.url = proxy.url.trim().to_string();
         proxy.user = proxy.user.trim().to_string();
         let (pw, clear_pw) = (h.proxy_pw.clone(), h.clear_proxy_pw);
+        let iface = h.iface.clone();
         self.bg(ctx, move |rt| {
             let r = (|| -> Result<()> {
                 let mut c = store::load()?;
@@ -1712,6 +1781,7 @@ impl App {
                     store::set_secret(store::PROXY_PW, &pw)?;
                 }
                 c.proxy = proxy;
+                c.hub_iface = iface;
                 store::save(&c)
             })();
             let _ = rt.reload();
@@ -1911,6 +1981,7 @@ impl App {
                 self.msg = (String::new(), false);
             }
             let scroll_to = self.form.as_mut().and_then(|f| f.scroll_to.take());
+            let adapters = if self.form.as_ref().is_some_and(|f| f.conn.kind == Kind::Ssh) { self.adapters() } else { vec![] };
             let e = |k: &str| errs.get(k).map(String::as_str);
             let sc = |k: &str| scroll_to == Some(k);
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2024,6 +2095,10 @@ impl App {
                         ui.end_row();
                     }
                 });
+                if f.conn.kind == Kind::Ssh {
+                    ui.add_space(6.0);
+                    adapter_section(ui, "conn-adapter", &mut f.conn.iface, &adapters, "the SSH connection to this machine");
+                }
                 ui.add_space(4.0);
                 ui.label(RichText::new("* required").color(RED).size(12.0));
                 ui.add_space(8.0);
@@ -2236,6 +2311,8 @@ impl App {
                         });
                     }
                 });
+            let adapters = self.adapters();
+            adapter_section(ui, "hub-adapter", &mut self.hub.iface, &adapters, "the connection to the hub (or to the proxy)");
             ui.add_space(4.0);
             ui.label(RichText::new("* required").color(RED).size(12.0));
             ui.add_space(6.0);
@@ -3061,6 +3138,54 @@ mod tests {
             app.clear_dlg = Some(ClearDlg { what: store::ClearWhat { connections: true, hub: true, security: false }, activity: true });
         }
         shot(&mut h, "v5-clear.png");
+        drop(h);
+
+        // network adapters: the hub on a real adapter, a robot on a missing one
+        let real = crate::netif::list().into_iter().find(|a| a.up).map(|a| a.name).unwrap_or_else(|| "eth0".into());
+        let mut cfg = store::load().unwrap();
+        cfg.name = "lyan-fx16".into();
+        cfg.hub_url = "wss://jp.example.org:22624".into();
+        cfg.hub_iface = real.clone();
+        cfg.connections.push(Connection {
+            name: "robot".into(),
+            host: "192.168.1.20".into(),
+            user: "ubuntu".into(),
+            iface: "Ethernet 2".into(),
+            ..Default::default()
+        });
+        store::save(&cfg).unwrap();
+        let tokio = tokio::runtime::Runtime::new().unwrap();
+        let rt = {
+            let _g = tokio.enter();
+            let rt = Runtime::new(false);
+            rt.reload().unwrap();
+            rt
+        };
+        let mut app = App::new(rt, tokio, false);
+        app.guide_hidden = true;
+        app.tab = Tab::Hub;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(MIN_SIZE[0], 760.0)).wgpu().build_state(
+            |ctx: &egui::Context, app: &mut App| {
+                setup_style(ctx);
+                ctx.set_theme(egui::Theme::Dark);
+                app.frame(ctx)
+            },
+            app,
+        );
+        assert!(!h.state().hub.dirty());
+        shot(&mut h, "v5-adapter-hub.png");
+        h.state_mut().open_form(Some("robot"));
+        h.state_mut().tab = Tab::Connections;
+        assert!(!h.state().form.as_ref().unwrap().dirty());
+        for _ in 0..6 {
+            h.step();
+        }
+        // scroll to the bottom of the form
+        h.state_mut().form.as_mut().unwrap().scroll_to = Some("key");
+        h.state_mut().form.as_mut().unwrap().conn.auth = Auth::Key;
+        h.state_mut().form.as_mut().unwrap().check = true;
+        h.set_size(egui::vec2(MIN_SIZE[0], 1500.0));
+        shot(&mut h, "v5-adapter-form.png");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
