@@ -3,7 +3,7 @@
 
 use crate::config::HubConfig;
 use anyhow::{Context, Result};
-use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Up};
+use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Tool, Up};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,14 +53,15 @@ impl Hub {
         out
     }
 
-    async fn request(&self, machine: &str, op: Op) -> OpResult {
+    async fn request(&self, machine: &str, op: Op, tool: Tool, call: u64) -> OpResult {
         let found = self.listed().into_iter().find(|(l, _)| l.name == machine);
         let Some((listed, cid)) = found else {
             let names: Vec<String> = self.listed().into_iter().map(|(l, _)| l.name).collect();
             return Err(format!("unknown machine '{machine}'. available: {}", if names.is_empty() { "(none)".into() } else { names.join(", ") }));
         };
+        // leave room for the owner to approve "ask" requests (up to 2 min)
         let timeout = match &op {
-            Op::Exec { timeout, .. } => Duration::from_secs(timeout + 30),
+            Op::Exec { timeout, .. } => Duration::from_secs(timeout + 180),
             _ => Duration::from_secs(600),
         };
         let id = self.id();
@@ -68,7 +69,7 @@ impl Hub {
         self.pending.lock().unwrap().insert(id, (cid, tx));
         let sent = {
             let conns = self.conns.lock().unwrap();
-            conns.get(&cid).map(|c| c.tx.send(Down::Req { id, machine: listed.info.alias.clone(), op }).is_ok())
+            conns.get(&cid).map(|c| c.tx.send(Down::Req { id, machine: listed.info.alias.clone(), op, tool, call }).is_ok())
         };
         if sent != Some(true) {
             self.pending.lock().unwrap().remove(&id);
@@ -125,7 +126,7 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
                 let Ok(req) = proto::read_frame::<_, IpcReq>(&mut s).await else { return };
                 let resp = match req {
                     IpcReq::Machines => IpcResp::Machines(h.listed().into_iter().map(|(l, _)| l).collect()),
-                    IpcReq::Op { machine, op } => IpcResp::Result(h.request(&machine, op).await),
+                    IpcReq::Op { machine, op, tool, call } => IpcResp::Result(h.request(&machine, op, tool, call).await),
                 };
                 let _ = proto::write_frame(&mut s, &resp).await;
             });
@@ -207,6 +208,16 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(hub: Arc<Hub
         match stream.next().await {
             Some(Ok(Message::Binary(b))) => match proto::decode::<Up>(&b)? {
                 Up::Hello { name, version } => {
+                    if !proto::compatible(&version, proto::VERSION) {
+                        let why = format!("connector v{version} does not match hub v{}; update the connector", proto::VERSION);
+                        eprintln!("connector '{name}' rejected: {why}");
+                        let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                            reason: why.into(),
+                        };
+                        let _ = sink.send(Message::Close(Some(frame))).await;
+                        return Ok(());
+                    }
                     eprintln!("connector '{name}' connected (token '{token_name}', v{version})");
                     break name;
                 }

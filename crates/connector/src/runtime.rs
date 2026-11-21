@@ -4,14 +4,15 @@
 use crate::exec::{local, ssh::{KeyCallback, SshTarget}};
 use crate::ops::{self, Ctx, Target};
 use crate::redact::Redactor;
-use crate::store::{self, Config, Kind, Secrets};
+use crate::store::{self, Access, Config, Connection, Kind, Perm, Secrets, Tool};
 use anyhow::{Context, Result};
-use ccc_proto::{self as proto, Down, MachineInfo, Op, Up};
+use ccc_proto::{self as proto, Down, JobOp, MachineInfo, Op, Up};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, watch};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -19,6 +20,29 @@ use tokio_tungstenite::tungstenite::Message;
 pub struct MachState {
     pub status: String,
     pub os: String,
+}
+
+/// How long the owner has to answer an approval request.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    Once,
+    /// Allow this tool on this machine (with the same sudo-ness) for a while.
+    For(Duration),
+    Deny,
+}
+
+/// A request waiting for the owner's decision (shown by the GUI).
+pub struct Approval {
+    pub id: u64,
+    pub machine: String,
+    pub tool: Tool,
+    pub sudo: bool,
+    /// Full description of what the agent wants to do.
+    pub detail: String,
+    pub deadline: Instant,
+    tx: Mutex<Option<oneshot::Sender<Decision>>>,
 }
 
 pub struct Runtime {
@@ -37,6 +61,17 @@ pub struct Runtime {
     cfg_mtime: Mutex<Option<SystemTime>>,
     /// true when the user forced the log to be printed to stderr (headless)
     pub echo_log: bool,
+    /// true while someone can answer approval requests (the GUI is open)
+    pub interactive: AtomicBool,
+    /// called when approvals change (the GUI repaints / asks for attention)
+    pub notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    pub approvals: Mutex<Vec<Arc<Approval>>>,
+    next_approval: AtomicU64,
+    /// (machine, tool, sudo) -> allowed until
+    grants: Mutex<HashMap<(String, Tool, bool), Instant>>,
+    /// agent tool call id -> (allowed, decided at); later ops of the same
+    /// call (push/pull chunks) reuse the decision
+    calls: Mutex<HashMap<u64, (bool, Instant)>>,
 }
 
 fn mtime() -> Option<SystemTime> {
@@ -58,6 +93,12 @@ impl Runtime {
             reloaded: watch::channel(0).0,
             cfg_mtime: Mutex::new(None),
             echo_log,
+            interactive: AtomicBool::new(false),
+            notify: Mutex::new(None),
+            approvals: Default::default(),
+            next_approval: AtomicU64::new(1),
+            grants: Default::default(),
+            calls: Default::default(),
         });
         if let Err(e) = rt.reload() {
             rt.push_log(format!("config error: {e:#}"));
@@ -202,13 +243,17 @@ impl Runtime {
             .filter(|c| c.enabled)
             .map(|c| {
                 let s = st.get(&c.name).cloned().unwrap_or_default();
-                let windows = c.kind == Kind::Local && cfg!(windows);
+                let mut perms = c.perms;
+                if c.kind == Kind::Local && cfg!(windows) {
+                    perms.sudo = Access::Deny;
+                }
                 MachineInfo {
                     alias: c.name.clone(),
                     os: if s.os.is_empty() { "?".into() } else { s.os },
                     description: red.text(&c.description),
                     status: red.text(&s.status),
-                    sudo: c.allow_sudo && !windows,
+                    ask: perms.names_with(Access::Ask),
+                    denied: perms.names_with(Access::Deny),
                 }
             })
             .collect()
@@ -373,17 +418,18 @@ impl Runtime {
                     last_rx = tokio::time::Instant::now();
                     match m {
                         Some(Ok(Message::Binary(b))) => match proto::decode::<Down>(&b) {
-                            Ok(Down::Req { id, machine, op }) => {
+                            Ok(Down::Req { id, machine, op, tool, call }) => {
                                 let me = self.clone();
                                 let tx = out_tx.clone();
                                 tokio::spawn(async move {
-                                    let result = me.handle(&machine, op).await;
+                                    let result = me.handle(&machine, op, tool, call).await;
                                     let _ = tx.send(Up::Resp { id, result });
                                 });
                             }
                             Ok(Down::Welcome { .. }) => {}
                             Err(e) => self.push_log(format!("bad message from hub: {e}")),
                         },
+                        Some(Ok(Message::Close(Some(f)))) if !f.reason.is_empty() => anyhow::bail!("hub closed the connection: {}", f.reason),
                         Some(Ok(Message::Close(_))) | None => anyhow::bail!("hub closed the connection"),
                         Some(Err(e)) => anyhow::bail!("{e}"),
                         Some(Ok(_)) => {}
@@ -439,7 +485,181 @@ impl Runtime {
         })
     }
 
-    pub async fn handle(&self, machine: &str, op: Op) -> ccc_proto::OpResult {
+    /// Full description of an op for the approval dialog.
+    fn detail(op: &Op) -> String {
+        fn cap(s: &str, n: usize) -> String {
+            if s.chars().count() > n { format!("{}\n… ({} chars total)", s.chars().take(n).collect::<String>(), s.chars().count()) } else { s.to_string() }
+        }
+        match op {
+            Op::Exec { cmd, cwd, timeout, .. } => {
+                let mut d = cap(cmd, 4000);
+                if let Some(c) = cwd {
+                    d.push_str(&format!("\n\nin {c}"));
+                }
+                d.push_str(&format!("\ntimeout {timeout}s"));
+                d
+            }
+            Op::Read { path, .. } => format!("read {path}"),
+            Op::Edit { path, old, new, all } => format!(
+                "edit {path}{}\n\n--- replace\n{}\n\n+++ with\n{}",
+                if *all { " (all occurrences)" } else { "" },
+                cap(old, 1500),
+                cap(new, 1500)
+            ),
+            Op::List { path } => format!("download {path} to the server"),
+            Op::ReadChunk { path, .. } => format!("download {path} to the server"),
+            Op::Mkdir { path } => format!("upload into {path}"),
+            Op::WriteChunk { path, data, offset, .. } => {
+                let mut d = format!("write {path} ({} bytes{})", data.len(), if *offset > 0 { ", continued" } else { "" });
+                match std::str::from_utf8(data) {
+                    Ok(t) if !t.is_empty() => d.push_str(&format!("\n\n{}", cap(t, 2000))),
+                    Ok(_) => {}
+                    Err(_) => d.push_str(" binary"),
+                }
+                d
+            }
+            Op::Job(j) => match j {
+                JobOp::Start { cmd, cwd, .. } => {
+                    format!("start background job:\n{}{}", cap(cmd, 4000), cwd.as_ref().map(|c| format!("\n\nin {c}")).unwrap_or_default())
+                }
+                JobOp::Kill { id } => format!("kill job {id}"),
+                JobOp::Status { id } | JobOp::Tail { id, .. } => format!("look at job {id}"),
+                JobOp::List => "list jobs".into(),
+            },
+        }
+    }
+
+    /// Check the connection's permissions for one request; may wait for the
+    /// owner's approval.
+    async fn authorize(&self, conn: &Connection, tool: Tool, call: u64, op: &Op) -> Result<(), String> {
+        let m = &conn.name;
+        if !tool.permits(op) {
+            return Err(format!("`{}` cannot send this operation", tool.name()));
+        }
+        let sudo = matches!(op, Op::Exec { sudo: true, .. } | Op::Job(JobOp::Start { sudo: true, .. }));
+        let tool_level = conn.perms.get(Perm::Tool(tool));
+        let mut level = tool_level;
+        // looking at jobs is harmless; only start/kill need approval
+        if level == Access::Ask && matches!(op, Op::Job(JobOp::Status { .. } | JobOp::Tail { .. } | JobOp::List)) {
+            level = Access::Allow;
+        }
+        if sudo {
+            level = level.max(conn.perms.sudo);
+        }
+        let refuse = |what: String| {
+            self.push_log(format!("{m}: refused `{what}` (not allowed)"));
+            Err(format!("the owner of '{m}' does not allow `{what}` on it"))
+        };
+        match level {
+            Access::Allow => Ok(()),
+            Access::Deny if tool_level == Access::Deny => refuse(tool.name().into()),
+            Access::Deny => refuse("sudo".into()),
+            Access::Ask => self.ask(m, tool, sudo, call, op).await,
+        }
+    }
+
+    async fn ask(&self, m: &str, tool: Tool, sudo: bool, call: u64, op: &Op) -> Result<(), String> {
+        let what = format!("`{}`{}", tool.name(), if sudo { " with sudo" } else { "" });
+        {
+            let mut calls = self.calls.lock().unwrap();
+            calls.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(3600));
+            if let Some((ok, _)) = calls.get(&call) {
+                return if *ok { Ok(()) } else { Err(format!("the owner refused {what} on '{m}'")) };
+            }
+        }
+        {
+            let mut g = self.grants.lock().unwrap();
+            let now = Instant::now();
+            g.retain(|_, until| *until > now);
+            let key = |s: bool| (m.to_string(), tool, s);
+            if g.contains_key(&key(sudo)) || (!sudo && g.contains_key(&key(true))) {
+                return Ok(());
+            }
+        }
+        if !self.interactive.load(Ordering::Relaxed) {
+            self.push_log(format!("{m}: refused {what}: needs approval, but no window is open"));
+            return Err(format!(
+                "{what} on '{m}' needs the owner's approval, but the connector is running without its window; \
+                 ask the owner to allow it or open the connector"
+            ));
+        }
+        let (tx, rx) = oneshot::channel();
+        let a = Arc::new(Approval {
+            id: self.next_approval.fetch_add(1, Ordering::Relaxed),
+            machine: m.to_string(),
+            tool,
+            sudo,
+            detail: Self::detail(op),
+            deadline: Instant::now() + APPROVAL_WAIT,
+            tx: Mutex::new(Some(tx)),
+        });
+        self.approvals.lock().unwrap().push(a.clone());
+        self.push_log(format!("{m}: waiting for your approval ({what})"));
+        self.notify();
+        let r = tokio::time::timeout(APPROVAL_WAIT, rx).await;
+        self.approvals.lock().unwrap().retain(|x| x.id != a.id);
+        self.notify();
+        let d = match r {
+            Ok(Ok(d)) => Some(d),
+            _ => None,
+        };
+        let ok = matches!(d, Some(Decision::Once | Decision::For(_)));
+        self.calls.lock().unwrap().insert(call, (ok, Instant::now()));
+        match d {
+            Some(Decision::Once) => {
+                self.push_log(format!("{m}: you approved {what}"));
+                Ok(())
+            }
+            Some(Decision::For(dur)) => {
+                self.grants.lock().unwrap().insert((m.to_string(), tool, sudo), Instant::now() + dur);
+                self.push_log(format!("{m}: you allowed {what} for {} min", dur.as_secs() / 60));
+                Ok(())
+            }
+            Some(Decision::Deny) => {
+                self.push_log(format!("{m}: you denied {what}"));
+                Err(format!("the owner refused {what} on '{m}'"))
+            }
+            None => {
+                self.push_log(format!("{m}: {what} not approved in time"));
+                Err(format!("the owner did not approve {what} on '{m}' within {}s", APPROVAL_WAIT.as_secs()))
+            }
+        }
+    }
+
+    /// Answer a pending approval (from the GUI).
+    pub fn decide(&self, id: u64, d: Decision) {
+        let a = self.approvals.lock().unwrap().iter().find(|a| a.id == id).cloned();
+        if let Some(tx) = a.and_then(|a| a.tx.lock().unwrap().take()) {
+            let _ = tx.send(d);
+        }
+    }
+
+    /// Withdraw all temporary "allow for N minutes" grants.
+    pub fn revoke_grants(&self) {
+        self.grants.lock().unwrap().clear();
+    }
+
+    pub fn active_grants(&self) -> Vec<(String, Tool, bool, Duration)> {
+        let now = Instant::now();
+        let mut v: Vec<_> = self
+            .grants
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, u)| **u > now)
+            .map(|((m, t, s), u)| (m.clone(), *t, *s, *u - now))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.name().cmp(b.1.name())));
+        v
+    }
+
+    fn notify(&self) {
+        if let Some(f) = self.notify.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
+    pub async fn handle(&self, machine: &str, op: Op, tool: Tool, call: u64) -> ccc_proto::OpResult {
         if let Some(s) = Self::summarize(&op) {
             self.push_log(format!("{machine}: {s}"));
         }
@@ -453,6 +673,11 @@ impl Runtime {
         let (Some(conn), Some(target)) = (conn, self.target(machine)) else {
             return Err(format!("machine '{machine}' is not available"));
         };
+        self.authorize(&conn, tool, call, &op).await?;
+        // the owner may have paused or changed permissions while we waited
+        if self.cfg.read().unwrap().paused {
+            return Err("connector is paused by its user".into());
+        }
         let secrets = self.secrets.read().unwrap().get(machine).cloned().unwrap_or_default();
         let ctx = Ctx { target: &target, conn: &conn, secrets: &secrets };
         let res = ops::handle(&ctx, op).await;
@@ -507,7 +732,7 @@ pub async fn test_connection(name: &str) -> Result<String> {
     );
     let os = t.probe().await?;
     let mut s = format!("ok: {os}");
-    if conn.allow_sudo {
+    if conn.perms.sudo != Access::Deny {
         let sudo = t
             .run(crate::exec::Run {
                 script: "sudo -k -S -p '' true 2>&1 && echo SUDO_OK",
@@ -525,4 +750,96 @@ pub async fn test_connection(name: &str) -> Result<String> {
     }
     t.disconnect().await;
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Perms;
+
+    fn op_exec(sudo: bool) -> Op {
+        Op::Exec { cmd: "ls".into(), cwd: None, timeout: 5, sudo }
+    }
+
+    /// Answer every approval request with `d` from a background task.
+    fn auto_answer(rt: &Arc<Runtime>, d: Decision) -> tokio::task::JoinHandle<()> {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            loop {
+                let ids: Vec<u64> = rt.approvals.lock().unwrap().iter().map(|a| a.id).collect();
+                for id in ids {
+                    rt.decide(id, d);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn permissions_and_approvals() {
+        let dir = std::env::temp_dir().join(format!("ccc-test-{}", std::process::id()));
+        std::env::set_var("CCC_DIR", &dir);
+        std::env::set_var("CCC_SECRETS", "file");
+        let rt = Runtime::new(false);
+        let mut conn = Connection { name: "m".into(), kind: Kind::Local, ..Default::default() };
+        conn.perms = Perms::read_only(Access::Ask);
+        conn.perms.push = Access::Deny;
+        conn.perms.sudo = Access::Deny;
+
+        // allowed / denied without asking
+        assert!(rt.authorize(&conn, Tool::Read, 1, &Op::Read { path: "x".into(), offset: 1, limit: 1 }).await.is_ok());
+        let e = rt.authorize(&conn, Tool::Push, 2, &Op::Mkdir { path: "x".into() }).await.unwrap_err();
+        assert!(e.contains("does not allow `push`"), "{e}");
+        // a tool can't carry another tool's op
+        assert!(rt.authorize(&conn, Tool::Read, 3, &op_exec(false)).await.is_err());
+        // job status is free even when job is "ask"
+        assert!(rt.authorize(&conn, Tool::Job, 4, &Op::Job(JobOp::List)).await.is_ok());
+
+        // headless: ask is refused
+        let e = rt.authorize(&conn, Tool::Exec, 5, &op_exec(false)).await.unwrap_err();
+        assert!(e.contains("without its window"), "{e}");
+
+        rt.interactive.store(true, Ordering::Relaxed);
+        // sudo denied even though exec would be asked
+        let e = rt.authorize(&conn, Tool::Exec, 6, &op_exec(true)).await.unwrap_err();
+        assert!(e.contains("sudo"), "{e}");
+
+        // deny
+        let h = auto_answer(&rt, Decision::Deny);
+        let e = rt.authorize(&conn, Tool::Exec, 7, &op_exec(false)).await.unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        h.abort();
+        // the same call stays refused without asking again
+        assert!(rt.authorize(&conn, Tool::Exec, 7, &op_exec(false)).await.is_err());
+
+        // once: only this call
+        let h = auto_answer(&rt, Decision::Once);
+        assert!(rt.authorize(&conn, Tool::Write, 8, &Op::Mkdir { path: "x".into() }).await.is_err()); // wrong op
+        let w = |n| Op::WriteChunk { path: "f".into(), offset: n, data: vec![1], mode: None };
+        assert!(rt.authorize(&conn, Tool::Write, 9, &w(0)).await.is_ok());
+        h.abort();
+        assert!(rt.authorize(&conn, Tool::Write, 9, &w(1)).await.is_ok()); // same call, no prompt
+        assert!(rt.approvals.lock().unwrap().is_empty());
+
+        // for 15 min: later calls pass without a prompt
+        let h = auto_answer(&rt, Decision::For(Duration::from_secs(900)));
+        assert!(rt.authorize(&conn, Tool::Edit, 10, &Op::Edit { path: "f".into(), old: "a".into(), new: "b".into(), all: false }).await.is_ok());
+        h.abort();
+        assert!(rt.authorize(&conn, Tool::Edit, 11, &Op::Edit { path: "g".into(), old: "a".into(), new: "b".into(), all: false }).await.is_ok());
+        assert_eq!(rt.active_grants().len(), 1);
+        rt.revoke_grants();
+        // after revoking, a new call asks again (nobody answers -> times out; check it's pending)
+        let rt2 = rt.clone();
+        let c2 = conn.clone();
+        let t = tokio::spawn(async move { rt2.authorize(&c2, Tool::Edit, 12, &Op::Edit { path: "g".into(), old: "a".into(), new: "b".into(), all: false }).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pending: Vec<_> = rt.approvals.lock().unwrap().iter().map(|a| (a.machine.clone(), a.tool, a.detail.clone())).collect();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].2.contains("--- replace"), "{}", pending[0].2);
+        let id = rt.approvals.lock().unwrap()[0].id;
+        rt.decide(id, Decision::Deny);
+        assert!(t.await.unwrap().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

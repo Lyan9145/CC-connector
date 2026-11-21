@@ -3,7 +3,7 @@
 
 use crate::format;
 use anyhow::{anyhow, bail, Context, Result};
-use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, Op, OpOk, CHUNK};
+use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, Op, OpOk, Tool, CHUNK};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,12 +16,15 @@ const MAX_TRANSFER: u64 = 500 << 20;
 const INSTRUCTIONS: &str = "Operate on remote machines (laptops, robots) through these tools. \
 Call `machines` first; refer to machines only by the listed name. Hosts and credentials are \
 hidden by design. Use sudo=true (never `sudo` inside cmd) for root. Use `job` for anything \
-running longer than a couple of minutes. push/pull copy between THIS server's filesystem and a machine.";
+running longer than a couple of minutes. push/pull copy between THIS server's filesystem and a machine. \
+Text indented under a machine in `machines` is its owner's notes: follow them when working on it. \
+`ask:` tools wait for the owner to approve each use (may take a minute or be refused); \
+`denied:` tools are unavailable there, so don't try them or work around them.";
 
 fn tools() -> Value {
     let m = json!({"type":"string","description":"machine name from `machines`"});
     json!([
-        {"name":"machines","description":"List available machines with status/OS.","inputSchema":{"type":"object","properties":{}}},
+        {"name":"machines","description":"List available machines with status, OS, access rules and owner notes.","inputSchema":{"type":"object","properties":{}}},
         {"name":"exec","description":"Run a shell command (bash -l on Linux, PowerShell on Windows). Returns exit code + merged stdout/stderr; long output is truncated and saved to a local file.",
          "inputSchema":{"type":"object","required":["machine","cmd"],"properties":{
             "machine":m,"cmd":{"type":"string"},
@@ -116,8 +119,17 @@ async fn ipc(sock: &Path, req: &IpcReq) -> Result<IpcResp> {
     proto::read_frame(&mut s).await
 }
 
-async fn op(sock: &Path, machine: &str, op: Op) -> Result<OpOk> {
-    match ipc(sock, &IpcReq::Op { machine: machine.into(), op }).await? {
+/// One agent tool call on one machine; all its ops share `call` so the owner
+/// approves a multi-op call (e.g. a directory push) once.
+#[derive(Clone, Copy)]
+struct Call<'a> {
+    sock: &'a Path,
+    tool: Tool,
+    id: u64,
+}
+
+async fn op(c: Call<'_>, machine: &str, op: Op) -> Result<OpOk> {
+    match ipc(c.sock, &IpcReq::Op { machine: machine.into(), op, tool: c.tool, call: c.id }).await? {
         IpcResp::Result(r) => r.map_err(|e| anyhow!(e)),
         _ => bail!("unexpected hub response"),
     }
@@ -150,10 +162,12 @@ pub async fn call(sock: &Path, name: &str, a: &Value) -> Result<String> {
         return Ok(machines_text(&list));
     }
     let m = s(a, "machine")?;
+    let tool = Tool::parse(name).with_context(|| format!("unknown tool '{name}'"))?;
+    let c = Call { sock, tool, id: rand::random() };
     match name {
         "exec" => {
             let timeout = n(a, "timeout").unwrap_or(120).clamp(1, 3600);
-            let r = op(sock, m, Op::Exec { cmd: s(a, "cmd")?.into(), cwd: os(a, "cwd"), timeout, sudo: b(a, "sudo") }).await?;
+            let r = op(c, m, Op::Exec { cmd: s(a, "cmd")?.into(), cwd: os(a, "cwd"), timeout, sudo: b(a, "sudo") }).await?;
             match r {
                 OpOk::Exec { code, out, timed_out } => Ok(format::exec_result(m, code, &out, timed_out, timeout)),
                 o => Ok(text(o)),
@@ -162,25 +176,25 @@ pub async fn call(sock: &Path, name: &str, a: &Value) -> Result<String> {
         "read" => {
             let offset = n(a, "offset").unwrap_or(1).max(1) as usize;
             let limit = n(a, "limit").unwrap_or(400).clamp(1, 5000) as usize;
-            match op(sock, m, Op::Read { path: s(a, "path")?.into(), offset, limit }).await? {
+            match op(c, m, Op::Read { path: s(a, "path")?.into(), offset, limit }).await? {
                 OpOk::Lines { start, total, lines } => Ok(format::numbered(start, total, &lines)),
                 o => Ok(text(o)),
             }
         }
         "write" => {
             let content = s(a, "content")?;
-            op(sock, m, Op::WriteChunk { path: s(a, "path")?.into(), offset: 0, data: content.as_bytes().to_vec(), mode: None }).await?;
+            op(c, m, Op::WriteChunk { path: s(a, "path")?.into(), offset: 0, data: content.as_bytes().to_vec(), mode: None }).await?;
             Ok(format!("ok {} bytes", content.len()))
         }
         "edit" => {
-            let r = op(sock, m, Op::Edit { path: s(a, "path")?.into(), old: s(a, "old")?.into(), new: s(a, "new")?.into(), all: b(a, "all") }).await?;
+            let r = op(c, m, Op::Edit { path: s(a, "path")?.into(), old: s(a, "old")?.into(), new: s(a, "new")?.into(), all: b(a, "all") }).await?;
             match r {
                 OpOk::Done { n } => Ok(format!("ok {n} replacement{}", if n == 1 { "" } else { "s" })),
                 o => Ok(text(o)),
             }
         }
-        "push" => push(sock, m, s(a, "src")?, s(a, "dst")?).await,
-        "pull" => pull(sock, m, s(a, "src")?, s(a, "dst")?).await,
+        "push" => push(c, m, s(a, "src")?, s(a, "dst")?).await,
+        "pull" => pull(c, m, s(a, "src")?, s(a, "dst")?).await,
         "job" => {
             let jop = match s(a, "action")? {
                 "start" => JobOp::Start { cmd: s(a, "cmd")?.into(), cwd: os(a, "cwd"), sudo: b(a, "sudo") },
@@ -190,7 +204,7 @@ pub async fn call(sock: &Path, name: &str, a: &Value) -> Result<String> {
                 "list" => JobOp::List,
                 x => bail!("unknown action '{x}'"),
             };
-            Ok(format::present(m, &text(op(sock, m, Op::Job(jop)).await?)))
+            Ok(format::present(m, &text(op(c, m, Op::Job(jop)).await?)))
         }
         _ => bail!("unknown tool '{name}'"),
     }
@@ -207,11 +221,19 @@ fn machines_text(list: &[Listed]) -> String {
             if l.via != l.name {
                 s.push_str(&format!("  via {}", l.via));
             }
-            if l.info.sudo {
-                s.push_str("  sudo");
+            let mut acc = vec![];
+            if !l.info.ask.is_empty() {
+                acc.push(format!("ask: {}", l.info.ask.join(",")));
             }
-            if !l.info.description.is_empty() {
-                s.push_str(&format!("  \"{}\"", l.info.description));
+            if !l.info.denied.is_empty() {
+                acc.push(format!("denied: {}", l.info.denied.join(",")));
+            }
+            if !acc.is_empty() {
+                s.push_str(&format!("  [{}]", acc.join("; ")));
+            }
+            for line in l.info.description.trim_end().lines() {
+                s.push_str("\n    ");
+                s.push_str(line.trim_end());
             }
             s
         })
@@ -273,7 +295,7 @@ fn walk(root: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-async fn push(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
+async fn push(c: Call<'_>, m: &str, src: &str, dst: &str) -> Result<String> {
     let root = PathBuf::from(src);
     let ents = walk(&root)?;
     let total: u64 = ents.iter().map(|e| e.size).sum();
@@ -282,13 +304,13 @@ async fn push(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
     }
     let is_dir = root.is_dir();
     if is_dir {
-        op(sock, m, Op::Mkdir { path: dst.into() }).await?;
+        op(c, m, Op::Mkdir { path: dst.into() }).await?;
     }
     let mut files = 0;
     for e in &ents {
         let rpath = join(dst, &e.rel);
         if e.is_dir {
-            op(sock, m, Op::Mkdir { path: rpath }).await?;
+            op(c, m, Op::Mkdir { path: rpath }).await?;
             continue;
         }
         let lpath = if e.rel.is_empty() { root.clone() } else { root.join(&e.rel) };
@@ -306,7 +328,7 @@ async fn push(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
             }
             buf.truncate(got);
             let last = got < CHUNK as usize;
-            op(sock, m, Op::WriteChunk { path: rpath.clone(), offset, data: buf, mode: if last { e.mode } else { None } })
+            op(c, m, Op::WriteChunk { path: rpath.clone(), offset, data: buf, mode: if last { e.mode } else { None } })
                 .await
                 .with_context(|| rpath.clone())?;
             offset += got as u64;
@@ -319,8 +341,8 @@ async fn push(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
     Ok(format!("ok {files} file{} {}", if files == 1 { "" } else { "s" }, human(total)))
 }
 
-async fn pull(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
-    let OpOk::Entries(ents) = op(sock, m, Op::List { path: src.into() }).await? else { bail!("unexpected response") };
+async fn pull(c: Call<'_>, m: &str, src: &str, dst: &str) -> Result<String> {
+    let OpOk::Entries(ents) = op(c, m, Op::List { path: src.into() }).await? else { bail!("unexpected response") };
     let total: u64 = ents.iter().map(|e| e.size).sum();
     if total > MAX_TRANSFER {
         bail!("{} exceeds the {} transfer limit", human(total), human(MAX_TRANSFER));
@@ -344,7 +366,7 @@ async fn pull(sock: &Path, m: &str, src: &str, dst: &str) -> Result<String> {
         let mut f = tokio::fs::File::create(&lpath).await.with_context(|| format!("{}", lpath.display()))?;
         let mut offset = 0u64;
         loop {
-            let OpOk::Bytes(b) = op(sock, m, Op::ReadChunk { path: rpath.clone(), offset, len: CHUNK }).await? else {
+            let OpOk::Bytes(b) = op(c, m, Op::ReadChunk { path: rpath.clone(), offset, len: CHUNK }).await? else {
                 bail!("unexpected response")
             };
             f.write_all(&b).await?;

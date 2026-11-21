@@ -18,10 +18,69 @@ pub struct MachineInfo {
     pub alias: String,
     /// e.g. "linux (Ubuntu 22.04.4 LTS)" or "windows"
     pub os: String,
+    /// Owner's notes for the agent (may be multi-line).
     pub description: String,
     /// "online", "connecting", or "error: ..." (redacted)
     pub status: String,
-    pub sudo: bool,
+    /// Tools (and "sudo") that need the owner's approval for each use.
+    pub ask: Vec<String>,
+    /// Tools (and "sudo") the owner does not allow on this machine.
+    pub denied: Vec<String>,
+}
+
+/// The agent-facing tools that act on a machine. Permissions are granted per
+/// tool; every request names the tool it belongs to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Tool {
+    Exec,
+    Read,
+    Write,
+    Edit,
+    Push,
+    Pull,
+    Job,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 7] = [Tool::Exec, Tool::Read, Tool::Write, Tool::Edit, Tool::Push, Tool::Pull, Tool::Job];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Exec => "exec",
+            Tool::Read => "read",
+            Tool::Write => "write",
+            Tool::Edit => "edit",
+            Tool::Push => "push",
+            Tool::Pull => "pull",
+            Tool::Job => "job",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|t| t.name() == s)
+    }
+
+    /// Whether `op` is something this tool legitimately sends (so a request
+    /// can't borrow a more permissive tool's name).
+    pub fn permits(self, op: &Op) -> bool {
+        matches!(
+            (self, op),
+            (Tool::Exec, Op::Exec { .. })
+                | (Tool::Read, Op::Read { .. })
+                | (Tool::Write, Op::WriteChunk { .. })
+                | (Tool::Edit, Op::Edit { .. })
+                | (Tool::Push, Op::Mkdir { .. } | Op::WriteChunk { .. })
+                | (Tool::Pull, Op::List { .. } | Op::ReadChunk { .. })
+                | (Tool::Job, Op::Job(_))
+        )
+    }
+}
+
+/// Hub and connector must share major.minor (the wire format may change
+/// between minor versions before 1.0).
+pub fn compatible(a: &str, b: &str) -> bool {
+    let mm = |v: &str| v.split('.').take(2).collect::<Vec<_>>().join(".");
+    mm(a) == mm(b)
 }
 
 /// A listed filesystem entry (used by pull). `rel` is relative to the listed
@@ -87,14 +146,16 @@ pub enum Up {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Down {
     Welcome { version: String },
-    Req { id: u64, machine: String, op: Op },
+    /// `call` identifies the agent's tool call; one call (e.g. a directory
+    /// push) can send many ops and needs only one approval.
+    Req { id: u64, machine: String, op: Op, tool: Tool, call: u64 },
 }
 
 /// Local IPC (MCP shim -> hub daemon), one request per connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcReq {
     Machines,
-    Op { machine: String, op: Op },
+    Op { machine: String, op: Op, tool: Tool, call: u64 },
 }
 
 /// A machine as presented to the agent (name may be "connector/alias").
@@ -163,6 +224,8 @@ mod tests {
             id: 7,
             machine: "robot".into(),
             op: Op::WriteChunk { path: "/tmp/x".into(), offset: 0, data: vec![0, 1, 255], mode: Some(0o755) },
+            tool: Tool::Push,
+            call: 9,
         };
         let b = encode(&m);
         let d: Down = decode(&b).unwrap();
@@ -176,6 +239,15 @@ mod tests {
         let r = Up::Resp { id: 1, result: Err("boom".into()) };
         let d: Up = decode(&encode(&r)).unwrap();
         assert!(matches!(d, Up::Resp { result: Err(e), .. } if e == "boom"));
+    }
+
+    #[test]
+    fn tools() {
+        assert!(Tool::Pull.permits(&Op::List { path: "/".into() }));
+        assert!(!Tool::Read.permits(&Op::Exec { cmd: "x".into(), cwd: None, timeout: 1, sudo: false }));
+        assert_eq!(Tool::parse("job"), Some(Tool::Job));
+        assert!(compatible("0.3.0", "0.3.7"));
+        assert!(!compatible("0.2.1", "0.3.0"));
     }
 
     #[test]

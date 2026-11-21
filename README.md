@@ -19,7 +19,8 @@ without ever showing the agent an IP address, user name or password.
 | `ccc-hub` | the Claude Code server | Accepts connectors, gives Claude 8 MCP tools, routes requests |
 | `ccc` | your laptop | Stores connections (passwords in the OS keyring), dials the hub, executes requests |
 
-The agent only sees each machine's **name, OS, status and your description**.
+The agent only sees each machine's **name, OS, status, access rules and your notes**. You decide,
+per machine and per tool, what it may do: allow, ask you first, or deny.
 
 ---
 
@@ -29,7 +30,7 @@ The agent only sees each machine's **name, OS, status and your description**.
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub)
   - [2. Laptop: the connector](#2-laptop-the-connector)
-  - [3. Adding machines](#3-adding-machines)
+  - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
 - [Agent tools reference](#agent-tools-reference)
 - [Security model](#security-model)
@@ -213,7 +214,11 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 - **Connections:** your machines. The dot shows each one's status (green online, amber
   connecting, red error, grey disabled/paused). Hover for the detail.
 - **Hub:** pairing and hub status.
-- **Activity:** every request the agent makes, e.g. `14:02:11 robot: exec [sudo] apt-get update`.
+- **Activity:** every request the agent makes, e.g. `14:02:11 robot: exec [sudo] apt-get update`,
+  including refused ones. Temporary "allow for 15 min" grants are listed at the top with a
+  **Revoke** button.
+- **Approval needed** pop-up: appears (and flashes the taskbar) when the agent uses a tool set to
+  *Ask*. See [Permissions](#permissions).
 - **Pause agent access** (top right): instantly hides all machines from the agent and refuses
   requests, without closing anything.
 
@@ -230,14 +235,69 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 | Host / Port / User | SSH address and login (SSH only). **Never shown to the agent.** |
 | Login | *Password* or *Private key* (key file such as `~/.ssh/id_ed25519`, optional passphrase). |
 | Password / sudo password | For password login this is the SSH password; it is also used for `sudo`. With key login or *This computer* it is only the sudo password. Saved in the OS keyring; leave empty to keep the saved one. |
-| Description | Shown to the agent. Say what the machine is: *"UR5 arm controller, ROS 2 Humble, workspace ~/ros_ws"*. |
+| Notes for agent | Multi-line text shown to the agent with the machine list. Use it as a system prompt for this machine: what it is, where things are, rules to follow (see below). |
 | Default directory | Where commands start (empty = home). |
 | Init commands | Run before every command, e.g. `source /opt/ros/humble/setup.bash`. |
-| Visible to agent | Untick to hide the machine without deleting it. |
-| Allow sudo | Lets the agent run commands as root (see [Security model](#security-model)). |
+| Visible to the agent | Untick to hide the machine completely without deleting it. |
+| Agent access | Allow / Ask / Deny for each tool and for sudo, or pick a preset (see [Permissions](#permissions)). |
 | Host key | Trusted on first connection and pinned afterwards; *Forget* after reinstalling the machine. |
 
 **Save and test** saves, connects, reports the OS, checks that sudo works, and pins the host key.
+
+#### Notes for the agent
+
+The notes are shown under the machine every time Claude lists machines, and Claude is told to
+follow them. For example:
+
+```
+UR5 arm controller. ROS 2 Humble, workspace ~/ros_ws (colcon build --symlink-install).
+The arm driver runs as the systemd service ur-driver; restart it with sudo, never kill it.
+Never publish to /cmd_vel or move the arm without asking me first.
+Logs: ~/ros_ws/log. Don't delete bags in ~/bags.
+```
+
+Keep them short: they cost tokens each time Claude lists machines.
+
+#### Permissions
+
+Each connection has one level per tool, plus one for running things as root:
+
+| Permission | Agent tool | Covers |
+|---|---|---|
+| Run commands | `exec` | any shell command |
+| Read files | `read` | reading text files |
+| Create / overwrite files | `write` | writing whole files |
+| Edit files | `edit` | find-and-replace in files |
+| Upload from server | `push` | copying files from the server to the machine |
+| Download to server | `pull` | copying files from the machine to the server |
+| Background jobs | `job` | starting and killing jobs (looking at jobs is always allowed unless *Deny*) |
+| Run as root (sudo) | `sudo=true` on `exec`/`job` | applies on top of the tool's own level |
+
+Levels:
+
+- **Allow:** runs without asking.
+- **Ask:** the connector shows an **Approval needed** pop-up with the full command, file path,
+  or edit (old and new text). Choose **Allow** (this request only), **Allow *tool* for 15 min**
+  (no more questions for that tool on that machine; revoke in *Activity*), or **Deny**. With no
+  answer in 2 minutes the request is refused. A multi-file `push`/`pull` is approved once for
+  the whole transfer. When the connector runs without its window (`ccc run`), *Ask* means
+  refused.
+- **Deny:** always refused. Claude sees `denied:` in the machine list and is told not to try.
+
+Presets: **Full access** (everything allowed, the default), **Ask before changes** (reading and
+downloading allowed, everything else asks), **Ask for everything**, **Read only** (reading and
+downloading only). Any other mix shows as *Custom*.
+
+What Claude sees:
+
+```
+robot  online  linux (Ubuntu 22.04.5 LTS)  via lab-pc  [ask: exec,write,edit,push,job,sudo]
+    UR5 arm controller. ROS 2 Humble, workspace ~/ros_ws ...
+```
+
+Keep in mind that `exec` can do anything a shell can: allowing `exec` while denying `write`
+does not really stop writes. For a machine Claude should only inspect, use **Read only**, or set
+`exec` to *Ask*.
 
 #### Typical setups
 
@@ -269,11 +329,13 @@ or for scripting). Passwords are always prompted for, never passed as arguments.
 
 ```bash
 ccc hub --pair 'ccc1:…' --name lab-pc        # pair (sets URL, token, certificate pin)
-ccc add laptop --local --desc "lab PC"
+ccc add laptop --local --desc "lab PC" --access ask
 ccc add robot --host 192.168.1.50 --user ubuntu --password \
-        --desc "UR5 arm, ROS 2 Humble" --init "source /opt/ros/humble/setup.bash" --cwd "~/ros_ws"
+        --desc-file robot-notes.txt --init "source /opt/ros/humble/setup.bash" --cwd "~/ros_ws"
+ccc edit robot --access read-only --allow exec --deny sudo   # preset, then exceptions
 ccc test robot
 ccc list
+ccc show robot                                # full permissions and notes
 ccc run                                       # headless; logs activity to the terminal
 ```
 
@@ -316,7 +378,7 @@ The MCP server is called `remote`. All results are plain text, kept short for to
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `machines` | — | one line per machine: `robot  online  linux (Ubuntu 22.04.5 LTS)  via laptop  sudo  "UR5 arm"` |
+| `machines` | — | one line per machine, e.g. `robot  online  linux (Ubuntu 22.04.5 LTS)  via laptop  [ask: exec; denied: sudo]`, then the owner's notes indented below it |
 | `exec` | `machine`, `cmd`, `cwd`?, `timeout`? (s, default 120, max 3600), `sudo`? | `exit=<code>` then merged stdout/stderr |
 | `read` | `machine`, `path`, `offset`? (1-based line), `limit`? (default 400) | numbered lines, plus `[lines a-b of n]` when partial |
 | `write` | `machine`, `path`, `content` | `ok <n> bytes` (parent folders are created) |
@@ -352,7 +414,7 @@ process tree.
 - **sudo without exposing the password.** With `sudo=true` the connector runs
   `sudo -S` and writes the saved password to sudo's standard input only; the agent's command,
   its environment and its variables never contain it. Without a saved password, `sudo -n` is used
-  (works only with passwordless sudo). Untick *Allow sudo* to forbid root on a machine.
+  (works only with passwordless sudo). Set *Run as root* to *Deny* to forbid root on a machine.
 - **Redaction.** Before anything leaves the laptop, configured hosts/IPs are replaced by
   `<name-host>`, and saved passwords, passphrases and the hub token by `***`. This is best effort:
   commands such as `ip addr` can still reveal network details, and `pull` copies files byte for
@@ -362,8 +424,11 @@ process tree.
   pinned certificate from the pairing code. Each connector has its own revocable token.
 - **SSH host keys** are trusted on first use and pinned; a changed key is refused until you
   *Forget* it.
-- **You stay in control:** *Pause agent access*, per-machine *Visible to agent*, and the
-  *Activity* log.
+- **Permissions are enforced on the laptop.** Each request carries the tool it belongs to, and
+  the connector checks it against that machine's settings (a request can't borrow another tool's
+  name). The hub and the agent can't change permissions.
+- **You stay in control:** per-tool Allow / Ask / Deny, *Pause agent access*, per-machine
+  *Visible to the agent*, and the *Activity* log.
 
 ---
 
@@ -391,13 +456,20 @@ process tree.
 | `ccc add NAME (--local \| --host H --user U) [options]` | add a connection |
 | `ccc edit NAME [--rename NEW] [options]` | change a connection |
 | `ccc rm NAME` · `ccc list` · `ccc test NAME` | remove / list / test |
+| `ccc show NAME` | full details: permissions per tool and notes |
 | `ccc forget-hostkey NAME` | accept a new SSH host key on next connect |
 | `ccc pause` · `ccc pause --off` | pause / resume agent access |
 | `ccc print-systemd` | print a systemd user unit for `ccc run` |
 
 Connection options for `add`/`edit`: `--port N`, `--key FILE`, `--password-auth`, `--password`
-(prompt), `--password-stdin`, `--passphrase` (prompt), `--clear-password`, `--desc TEXT`,
-`--cwd DIR`, `--init CMDS`, `--sudo` / `--no-sudo`, `--enable` / `--disable`.
+(prompt), `--password-stdin`, `--passphrase` (prompt), `--clear-password`, `--desc TEXT` (a
+literal `\n` becomes a line break), `--desc-file FILE`, `--cwd DIR`, `--init CMDS`,
+`--enable` / `--disable`.
+
+Permission options: `--access full|ask|ask-all|read-only` (preset), then `--allow TOOLS`,
+`--ask TOOLS`, `--deny TOOLS`, where TOOLS is a comma list of `exec read write edit push pull job
+sudo` or `all`. These may be repeated and apply after the preset. `--sudo` / `--no-sudo` are
+short for `--allow sudo` / `--deny sudo`.
 
 ---
 
@@ -432,6 +504,9 @@ Connection options for `add`/`edit`: `--port N`, `--key FILE`, `--password-auth`
 | A machine shows **error: …** | Use **Save and test** on it for details (wrong password, host unreachable, SSH not installed…). |
 | "HOST KEY MISMATCH" | The SSH host was reinstalled or its address now points elsewhere. If expected, press *Forget* (or `ccc forget-hostkey NAME`). |
 | "sudo FAILED" in the test, or sudo errors from the agent | Save the correct sudo password for that machine, and make sure the user is in the `sudo` group. |
+| "needs the owner's approval, but the connector is running without its window" | That tool is set to *Ask* and nobody can answer. Open the GUI, or change it to *Allow*. |
+| "the owner of '…' does not allow `…`" | Set to *Deny* in that machine's *Agent access*. |
+| "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.3.x). Update the older one. |
 | "OS keyring unavailable" on Linux | Start a desktop session / gnome-keyring, or set `CCC_SECRETS=file`. |
 | Claude Code doesn't show the `remote` tools | Start a new session; check `claude mcp list`. |
 

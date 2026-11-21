@@ -9,7 +9,7 @@ mod store;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use store::{Auth, Connection, Kind};
+use store::{Access, Auth, Connection, Kind, Perm};
 
 /// CC-connector: lets Claude Code on your server work on this machine and on
 /// SSH hosts reachable from it. Run without arguments to open the GUI.
@@ -63,6 +63,8 @@ enum Cmd {
     Rm { name: String },
     /// List connections.
     List,
+    /// Show one connection in full (permissions, notes).
+    Show { name: String },
     /// Test a connection (trusts the host key on first use).
     Test { name: String },
     /// Forget the trusted host key of a connection.
@@ -105,16 +107,35 @@ struct ConnArgs {
     /// Remove the saved password.
     #[arg(long)]
     clear_password: bool,
+    /// Notes for the agent (may be multi-line; shown with the machine list).
     #[arg(long)]
     desc: Option<String>,
+    /// Read the notes for the agent from a file.
+    #[arg(long, value_name = "FILE")]
+    desc_file: Option<String>,
     /// Default working directory.
     #[arg(long)]
     cwd: Option<String>,
     /// Shell lines prepended to every command (e.g. source a ROS setup).
     #[arg(long)]
     init: Option<String>,
+    /// Permission preset: full, ask (ask before changes), ask-all, read-only.
+    #[arg(long, value_name = "PRESET")]
+    access: Option<String>,
+    /// Allow these without asking, e.g. --allow read,pull  (tools: exec read
+    /// write edit push pull job sudo, or "all"). Applied after --access.
+    #[arg(long, value_name = "TOOLS")]
+    allow: Vec<String>,
+    /// Ask the owner (in the GUI) before each use of these.
+    #[arg(long, value_name = "TOOLS")]
+    ask: Vec<String>,
+    /// Never allow these.
+    #[arg(long, value_name = "TOOLS")]
+    deny: Vec<String>,
+    /// Same as --allow sudo.
     #[arg(long)]
     sudo: bool,
+    /// Same as --deny sudo.
     #[arg(long)]
     no_sudo: bool,
     #[arg(long)]
@@ -127,6 +148,16 @@ fn read_stdin_line() -> Result<String> {
     let mut s = String::new();
     std::io::stdin().read_line(&mut s)?;
     Ok(s.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn perm_list(s: &str) -> Result<Vec<Perm>> {
+    if s.trim() == "all" {
+        return Ok(Perm::ALL.to_vec());
+    }
+    s.split([',', ' '])
+        .filter(|x| !x.is_empty())
+        .map(|x| Perm::parse(x).with_context(|| format!("unknown tool '{x}' (exec read write edit push pull job sudo)")))
+        .collect()
 }
 
 fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
@@ -151,7 +182,10 @@ fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
         c.auth = Auth::Password;
     }
     if let Some(v) = &o.desc {
-        c.description = v.clone();
+        c.description = v.replace("\\n", "\n");
+    }
+    if let Some(f) = &o.desc_file {
+        c.description = std::fs::read_to_string(f).with_context(|| format!("read {f}"))?.trim_end().to_string();
     }
     if let Some(v) = &o.cwd {
         c.cwd = v.clone();
@@ -159,11 +193,24 @@ fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
     if let Some(v) = &o.init {
         c.init = v.clone();
     }
+    if let Some(p) = &o.access {
+        let Some((_, _, perms)) = store::PRESETS.iter().find(|(k, _, _)| k == p) else {
+            bail!("unknown preset '{p}' (full, ask, ask-all, read-only)");
+        };
+        c.perms = *perms;
+    }
+    for (list, level) in [(&o.allow, Access::Allow), (&o.ask, Access::Ask), (&o.deny, Access::Deny)] {
+        for l in list {
+            for p in perm_list(l)? {
+                c.perms.set(p, level);
+            }
+        }
+    }
     if o.sudo {
-        c.allow_sudo = true;
+        c.perms.sudo = Access::Allow;
     }
     if o.no_sudo {
-        c.allow_sudo = false;
+        c.perms.sudo = Access::Deny;
     }
     if o.enable {
         c.enabled = true;
@@ -334,15 +381,44 @@ fn main() -> Result<()> {
                         }
                     ),
                 };
+                let first = x.description.lines().next().unwrap_or("");
+                let more = if x.description.lines().count() > 1 { " …" } else { "" };
                 println!(
-                    "{:12} {:8} {}{}{}{}",
+                    "{:12} {:8} {}{}  access: {}{}",
                     x.name,
                     if x.enabled { "enabled" } else { "disabled" },
                     what,
                     if pw { "  pw:saved" } else { "" },
-                    if x.allow_sudo { "  sudo" } else { "" },
-                    if x.description.is_empty() { String::new() } else { format!("  \"{}\"", x.description) }
+                    x.perms.summary(),
+                    if first.is_empty() { String::new() } else { format!("  \"{first}{more}\"") }
                 );
+            }
+            Ok(())
+        }
+        Cmd::Show { name } => {
+            let c = store::load()?;
+            let x = c.get(&name).with_context(|| format!("no connection '{name}'"))?;
+            println!("name:     {}{}", x.name, if x.enabled { "" } else { "  (disabled: hidden from the agent)" });
+            match x.kind {
+                Kind::Local => println!("type:     this computer"),
+                Kind::Ssh => println!("type:     ssh {}@{}:{}", x.user, x.host, x.port),
+            }
+            if !x.cwd.is_empty() {
+                println!("cwd:      {}", x.cwd);
+            }
+            if !x.init.is_empty() {
+                println!("init:     {}", x.init.replace('\n', "\n          "));
+            }
+            println!("access:   {}", x.perms.summary());
+            for p in Perm::ALL {
+                println!("  {:6} {}", p.name(), format!("{:?}", x.perms.get(p)).to_lowercase());
+            }
+            println!("notes for the agent:");
+            if x.description.is_empty() {
+                println!("  (none)");
+            }
+            for l in x.description.lines() {
+                println!("  {l}");
             }
             Ok(())
         }

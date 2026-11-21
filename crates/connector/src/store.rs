@@ -1,6 +1,7 @@
 //! Connector configuration (non-secret, TOML) and secrets (OS keyring).
 
 use anyhow::{bail, Context, Result};
+pub use ccc_proto::Tool;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -20,6 +21,154 @@ pub enum Auth {
     Key,
 }
 
+/// How the agent may use a tool on a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    #[default]
+    Allow,
+    /// The owner approves each use in the GUI (refused when headless).
+    Ask,
+    Deny,
+}
+
+/// Per-connection permissions: one level per tool plus one for sudo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Perms {
+    pub exec: Access,
+    pub read: Access,
+    pub write: Access,
+    pub edit: Access,
+    pub push: Access,
+    pub pull: Access,
+    pub job: Access,
+    /// Running anything as root (exec/job with sudo=true).
+    pub sudo: Access,
+}
+
+/// Something a permission is set for: a tool, or sudo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Perm {
+    Tool(Tool),
+    Sudo,
+}
+
+impl Perm {
+    pub const ALL: [Perm; 8] = [
+        Perm::Tool(Tool::Exec),
+        Perm::Tool(Tool::Read),
+        Perm::Tool(Tool::Write),
+        Perm::Tool(Tool::Edit),
+        Perm::Tool(Tool::Push),
+        Perm::Tool(Tool::Pull),
+        Perm::Tool(Tool::Job),
+        Perm::Sudo,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Perm::Tool(t) => t.name(),
+            Perm::Sudo => "sudo",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Perm> {
+        if s == "sudo" { Some(Perm::Sudo) } else { Tool::parse(s).map(Perm::Tool) }
+    }
+
+    /// Human description for the GUI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Perm::Tool(Tool::Exec) => "Run commands",
+            Perm::Tool(Tool::Read) => "Read files",
+            Perm::Tool(Tool::Write) => "Create / overwrite files",
+            Perm::Tool(Tool::Edit) => "Edit files",
+            Perm::Tool(Tool::Push) => "Upload from server",
+            Perm::Tool(Tool::Pull) => "Download to server",
+            Perm::Tool(Tool::Job) => "Background jobs",
+            Perm::Sudo => "Run as root (sudo)",
+        }
+    }
+}
+
+/// Named permission sets offered in the GUI and CLI.
+pub const PRESETS: [(&str, &str, Perms); 4] = [
+    ("full", "Full access", Perms::uniform(Access::Allow)),
+    ("ask", "Ask before changes", Perms::read_only(Access::Ask)),
+    ("ask-all", "Ask for everything", Perms::uniform(Access::Ask)),
+    ("read-only", "Read only", Perms::read_only(Access::Deny)),
+];
+
+impl Perms {
+    pub const fn uniform(a: Access) -> Perms {
+        Perms { exec: a, read: a, write: a, edit: a, push: a, pull: a, job: a, sudo: a }
+    }
+
+    /// Reading allowed; everything else set to `rest`.
+    pub const fn read_only(rest: Access) -> Perms {
+        Perms { read: Access::Allow, pull: Access::Allow, ..Perms::uniform(rest) }
+    }
+
+    pub fn get(&self, p: Perm) -> Access {
+        *self.slot(p)
+    }
+
+    pub fn set(&mut self, p: Perm, a: Access) {
+        *self.slot_mut(p) = a;
+    }
+
+    fn slot(&self, p: Perm) -> &Access {
+        match p {
+            Perm::Tool(Tool::Exec) => &self.exec,
+            Perm::Tool(Tool::Read) => &self.read,
+            Perm::Tool(Tool::Write) => &self.write,
+            Perm::Tool(Tool::Edit) => &self.edit,
+            Perm::Tool(Tool::Push) => &self.push,
+            Perm::Tool(Tool::Pull) => &self.pull,
+            Perm::Tool(Tool::Job) => &self.job,
+            Perm::Sudo => &self.sudo,
+        }
+    }
+
+    fn slot_mut(&mut self, p: Perm) -> &mut Access {
+        match p {
+            Perm::Tool(Tool::Exec) => &mut self.exec,
+            Perm::Tool(Tool::Read) => &mut self.read,
+            Perm::Tool(Tool::Write) => &mut self.write,
+            Perm::Tool(Tool::Edit) => &mut self.edit,
+            Perm::Tool(Tool::Push) => &mut self.push,
+            Perm::Tool(Tool::Pull) => &mut self.pull,
+            Perm::Tool(Tool::Job) => &mut self.job,
+            Perm::Sudo => &mut self.sudo,
+        }
+    }
+
+    /// Key of the matching preset, if any.
+    pub fn preset(&self) -> Option<&'static str> {
+        PRESETS.iter().find(|(_, _, p)| p == self).map(|(k, _, _)| *k)
+    }
+
+    pub fn names_with(&self, a: Access) -> Vec<String> {
+        Perm::ALL.into_iter().filter(|p| self.get(*p) == a).map(|p| p.name().to_string()).collect()
+    }
+
+    /// One-line summary, e.g. "full" or "ask: exec,write; deny: sudo".
+    pub fn summary(&self) -> String {
+        if let Some(k) = self.preset() {
+            return k.to_string();
+        }
+        let mut parts = vec![];
+        for (a, n) in [(Access::Ask, "ask"), (Access::Deny, "deny")] {
+            let v = self.names_with(a);
+            if !v.is_empty() {
+                parts.push(format!("{n}: {}", v.join(",")));
+            }
+        }
+        parts.join("; ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Connection {
@@ -30,15 +179,21 @@ pub struct Connection {
     pub user: String,
     pub auth: Auth,
     pub key_path: String,
+    /// Notes for the agent (multi-line; e.g. what the machine is and rules
+    /// to follow on it).
     pub description: String,
     /// Default working directory for exec/jobs.
     pub cwd: String,
     /// Prepended to every command, e.g. `source /opt/ros/humble/setup.bash`.
     pub init: String,
     pub enabled: bool,
-    pub allow_sudo: bool,
     /// Trusted host key fingerprint (TOFU), e.g. "SHA256:...".
     pub host_key: String,
+    /// What the agent may do on this connection.
+    pub perms: Perms,
+    /// Pre-0.3 config; migrated into `perms.sudo` on load.
+    #[serde(skip_serializing)]
+    pub allow_sudo: Option<bool>,
 }
 
 impl Default for Connection {
@@ -55,8 +210,9 @@ impl Default for Connection {
             cwd: String::new(),
             init: String::new(),
             enabled: true,
-            allow_sudo: true,
             host_key: String::new(),
+            perms: Perms::default(),
+            allow_sudo: None,
         }
     }
 }
@@ -118,6 +274,11 @@ pub fn load() -> Result<Config> {
     let mut c: Config = toml::from_str(&s).with_context(|| format!("parse {}", p.display()))?;
     if c.name.is_empty() {
         c.name = hostname();
+    }
+    for conn in &mut c.connections {
+        if conn.allow_sudo.take() == Some(false) {
+            conn.perms.sudo = Access::Deny;
+        }
     }
     Ok(c)
 }
@@ -283,4 +444,30 @@ pub fn apply_pairing(code: &str) -> Result<Pairing> {
     set_secret(HUB_TOKEN, &p.token)?;
     save(&c)?;
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perms_toml_and_migration() {
+        let old = "name = \"x\"\n[[connection]]\nname = \"r\"\nkind = \"local\"\nallow_sudo = false\n\
+                   description = \"\"\"\nline one\nline two\"\"\"\n";
+        let mut c: Config = toml::from_str(old).unwrap();
+        assert_eq!(c.connections[0].allow_sudo, Some(false));
+        for conn in &mut c.connections {
+            if conn.allow_sudo.take() == Some(false) {
+                conn.perms.sudo = Access::Deny;
+            }
+        }
+        assert_eq!(c.connections[0].perms.summary(), "deny: sudo");
+        assert_eq!(c.connections[0].description, "line one\nline two");
+        c.connections[0].perms = Perms::read_only(Access::Ask);
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(!s.contains("allow_sudo"), "{s}");
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.connections[0].perms.preset(), Some("ask"));
+        assert_eq!(back.connections[0].description, "line one\nline two");
+    }
 }

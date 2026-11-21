@@ -31,8 +31,8 @@ impl Ctx<'_> {
         if !want {
             return Ok(Sudo::No);
         }
-        if !self.conn.allow_sudo {
-            bail!("sudo is disabled for this machine (enable 'allow sudo' in the connector)");
+        if self.conn.perms.sudo == crate::store::Access::Deny {
+            bail!("the owner does not allow sudo on this machine");
         }
         if self.family() == Family::Windows {
             bail!("sudo is not available on Windows; run the connector as Administrator instead");

@@ -3,8 +3,8 @@
 //! Anything that touches disk, the keyring or the network runs on the tokio
 //! runtime and reports back through `events`, so the UI never blocks.
 
-use crate::runtime::{self, Runtime};
-use crate::store::{self, Auth, Connection, Kind};
+use crate::runtime::{self, Decision, Runtime};
+use crate::store::{self, Access, Auth, Connection, Kind, Perm};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::sync::{Arc, Mutex};
@@ -56,6 +56,8 @@ struct App {
     test: Option<String>,
     busy: bool,
     events: Arc<Mutex<Vec<Event>>>,
+    /// highest approval id we already asked the OS to flash the window for
+    seen_approval: u64,
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -93,6 +95,7 @@ pub fn run() -> Result<()> {
         test: None,
         busy: false,
         events: Default::default(),
+        seen_approval: 0,
     };
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([880.0, 620.0]).with_title("CC-connector");
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
@@ -104,6 +107,9 @@ pub fn run() -> Result<()> {
         opts,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
+            let ctx = cc.egui_ctx.clone();
+            *app.rt.notify.lock().unwrap() = Some(Box::new(move || ctx.request_repaint()));
+            app.rt.interactive.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(Box::new(app))
         }),
     )
@@ -174,6 +180,62 @@ fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
     p.circle_filled(egui::pos2(rect.left() + 9.0, rect.center().y), 3.0, Color32::WHITE);
     p.galley(egui::pos2(rect.left() + 15.0, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
     resp
+}
+
+fn access_color(a: Access) -> Color32 {
+    match a {
+        Access::Allow => GREEN,
+        Access::Ask => AMBER,
+        Access::Deny => RED,
+    }
+}
+
+/// Preset picker plus an Allow / Ask / Deny row per tool.
+fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label("Preset");
+            let cur = p.preset().and_then(|k| store::PRESETS.iter().find(|x| x.0 == k)).map(|x| x.1).unwrap_or("Custom");
+            egui::ComboBox::from_id_salt("preset").selected_text(cur).show_ui(ui, |ui| {
+                for (_, label, preset) in store::PRESETS {
+                    if ui.selectable_label(*p == preset, label).clicked() {
+                        *p = preset;
+                    }
+                }
+            });
+        });
+        egui::Grid::new("perms").num_columns(4).spacing([12.0, 3.0]).striped(true).show(ui, |ui| {
+            ui.label("");
+            for a in ["Allow", "Ask", "Deny"] {
+                ui.label(RichText::new(a).strong());
+            }
+            ui.end_row();
+            for perm in Perm::ALL {
+                let na = perm == Perm::Sudo && windows_local;
+                let cur = p.get(perm);
+                ui.horizontal(|ui| {
+                    dot(ui, if na { GREY } else { access_color(cur) });
+                    ui.label(perm.label()).on_hover_text(format!("agent tool `{}`", perm.name()));
+                });
+                for a in [Access::Allow, Access::Ask, Access::Deny] {
+                    let mut v = cur;
+                    if ui.add_enabled(!na, egui::RadioButton::new(v == a, "")).clicked() {
+                        v = a;
+                        p.set(perm, v);
+                    }
+                }
+                if na {
+                    ui.label(RichText::new("n/a on Windows").weak());
+                }
+                ui.end_row();
+            }
+        });
+        ui.label(
+            RichText::new("Ask: you approve each use in a pop-up here (refused if this window is closed or headless).")
+                .weak()
+                .size(12.0),
+        );
+    });
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -441,7 +503,8 @@ impl App {
                         let sel = self.form.as_ref().is_some_and(|f| f.orig == c.name);
                         let kind = if c.kind == Kind::Local { "  (this computer)" } else { "" };
                         let text = RichText::new(format!("{}{kind}", c.name)).size(14.0);
-                        if ui.selectable_label(sel, text).on_hover_text(s).clicked() {
+                        let tip = format!("{s}\naccess: {}", c.perms.summary());
+                        if ui.selectable_label(sel, text).on_hover_text(tip).clicked() {
                             let n = c.name.clone();
                             self.open_form(Some(&n));
                         }
@@ -526,9 +589,19 @@ impl App {
                         }
                     });
                     ui.end_row();
-                    ui.label("Description");
-                    ui.text_edit_singleline(&mut f.conn.description)
-                        .on_hover_text("Shown to the agent, e.g. 'UR5 arm controller, ROS 2 Humble'");
+                    ui.label("Notes for agent").on_hover_text(
+                        "Shown to the agent with the machine list, like a system prompt for this machine",
+                    );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut f.conn.description)
+                            .desired_rows(5)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(
+                                "What this machine is and how to work on it, e.g.\n\
+                                 UR5 arm controller, ROS 2 Humble in ~/ws.\n\
+                                 Never move the arm without asking me first.",
+                            ),
+                    );
                     ui.end_row();
                     ui.label("Default directory");
                     ui.text_edit_singleline(&mut f.conn.cwd).on_hover_text("Where commands start; empty = home");
@@ -536,14 +609,15 @@ impl App {
                     ui.label("Init commands");
                     ui.add(egui::TextEdit::multiline(&mut f.conn.init).desired_rows(2).hint_text("e.g. source /opt/ros/humble/setup.bash"));
                     ui.end_row();
-                    ui.label("Options");
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut f.conn.enabled, "Visible to agent");
-                        ui.checkbox(&mut f.conn.allow_sudo, "Allow sudo").on_hover_text(
-                            "The agent may run commands as root; the saved password is fed to sudo without being shown to it",
-                        );
-                    });
+                    ui.label("Agent access");
+                    ui.checkbox(&mut f.conn.enabled, "Visible to the agent")
+                        .on_hover_text("When off, the agent can't see or use this machine at all");
                     ui.end_row();
+                    if f.conn.enabled {
+                        ui.label("");
+                        perms_editor(ui, &mut f.conn.perms, f.conn.kind == Kind::Local && cfg!(windows));
+                        ui.end_row();
+                    }
                     if f.conn.kind == Kind::Ssh {
                         ui.label("Host key");
                         ui.horizontal(|ui| {
@@ -717,6 +791,63 @@ impl App {
         self.msg_line(ui);
     }
 
+    /// Pop-up for requests waiting on the owner's approval.
+    fn approvals(&mut self, ctx: &egui::Context) {
+        let pending: Vec<_> = self.rt.approvals.lock().unwrap().clone();
+        let Some(a) = pending.first().cloned() else { return };
+        if a.id > self.seen_approval {
+            self.seen_approval = pending.iter().map(|a| a.id).max().unwrap_or(a.id);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        let left = a.deadline.saturating_duration_since(std::time::Instant::now()).as_secs();
+        let what = format!("{}{}", a.tool.name(), if a.sudo { " as root (sudo)" } else { "" });
+        let mut decision = None;
+        egui::Window::new(RichText::new("Approval needed").strong())
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("The agent wants to use");
+                    ui.label(RichText::new(&what).strong().color(if a.sudo { RED } else { AMBER }));
+                    ui.label("on");
+                    ui.label(RichText::new(&a.machine).strong());
+                });
+                ui.add_space(4.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        ui.label(RichText::new(&a.detail).monospace());
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Allow").strong().color(GREEN)).clicked() {
+                        decision = Some(Decision::Once);
+                    }
+                    if ui
+                        .button(format!("Allow {} for 15 min", a.tool.name()))
+                        .on_hover_text(format!("Don't ask again for `{what}` on {} for 15 minutes", a.machine))
+                        .clicked()
+                    {
+                        decision = Some(Decision::For(std::time::Duration::from_secs(15 * 60)));
+                    }
+                    if ui.button(RichText::new("Deny").strong().color(RED)).clicked() {
+                        decision = Some(Decision::Deny);
+                    }
+                });
+                let more = if pending.len() > 1 { format!("  ·  {} more waiting", pending.len() - 1) } else { String::new() };
+                ui.label(RichText::new(format!("refused automatically in {left}s{more}")).weak());
+            });
+        if let Some(d) = decision {
+            self.rt.decide(a.id, d);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
     fn activity(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Activity");
@@ -725,6 +856,18 @@ impl App {
             }
         });
         ui.label("Every request the agent makes is listed here.");
+        let grants = self.rt.active_grants();
+        if !grants.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Temporarily allowed:").color(AMBER));
+                for (m, t, sudo, left) in &grants {
+                    ui.label(format!("{} on {m} ({} min)", if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() }, left.as_secs() / 60 + 1));
+                }
+                if ui.small_button("Revoke").clicked() {
+                    self.rt.revoke_grants();
+                }
+            });
+        }
         ui.separator();
         let lines: Vec<String> = self.rt.log.lock().unwrap().iter().cloned().collect();
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
@@ -743,6 +886,7 @@ impl eframe::App for App {
             self.top(ui);
             ui.add_space(4.0);
         });
+        self.approvals(ctx);
         match self.tab {
             Tab::Connections => self.connections(ctx),
             Tab::Hub => {
