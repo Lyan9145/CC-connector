@@ -179,6 +179,41 @@ pub enum IpcReq {
     Machines,
     Op { machine: String, op: Op, tool: Tool, call: u64, session: Session },
     EndSession { id: u64 },
+    /// `ccc-hub token ...` run against a running hub; the hub applies it as
+    /// the calling OS user (identified by the socket's peer credentials).
+    Token(TokenReq),
+}
+
+/// Token management over the local socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TokenReq {
+    /// `owners`: users / `@groups` allowed to use the machine (besides the
+    /// creator, for a non-admin).
+    New { name: String, owners: Vec<String> },
+    Pair { name: String },
+    List,
+    Revoke { name: String },
+    Share { name: String, who: Vec<String> },
+    Unshare { name: String, who: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TokenResp {
+    /// A new secret (new token or `pair`); `pairing` is set when the hub has
+    /// a public URL.
+    Created { name: String, token: String, pairing: Option<String>, replaced: bool },
+    List(Vec<TokenInfo>),
+    Done(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenInfo {
+    pub name: String,
+    pub owners: Vec<String>,
+    /// empty = made by the admin
+    pub created_by: String,
+    /// None when not known (hub not running)
+    pub online: Option<bool>,
 }
 
 /// A machine as presented to the agent (name may be "connector/alias").
@@ -193,6 +228,7 @@ pub struct Listed {
 pub enum IpcResp {
     Machines(Vec<Listed>),
     Result(OpResult),
+    Token(Result<TokenResp, String>),
 }
 
 pub fn encode<T: Serialize>(v: &T) -> Vec<u8> {

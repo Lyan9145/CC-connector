@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use crate::users::Caller;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -8,6 +9,14 @@ pub struct Token {
     pub name: String,
     /// hex sha256 of the token string
     pub sha256: String,
+    /// Users ("alice") and groups ("@lab") whose agents may use the
+    /// connector's machines. Empty = the admin only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
+    /// User who made the token with self-service (may pair/revoke/share
+    /// it); empty = made by the admin.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +32,17 @@ pub struct HubConfig {
     /// URL connectors use to reach this hub, e.g. wss://example.com:22624
     /// (used to build pairing codes).
     pub public_url: String,
+    /// Several OS users share this hub: the socket moves to
+    /// /run/ccc-hub/hub.sock (unless `socket` is set) and opens to all local
+    /// users; each sees only the machines whose token lists them.
+    pub multi_user: bool,
+    /// The admin (root and the hub's own user) sees every machine. Off: only
+    /// tokens without owners and those listing the admin.
+    pub root_all_access: bool,
+    /// Non-admin users may create tokens for themselves (`ccc-hub token new`).
+    pub self_service: bool,
+    /// Cap on self-service tokens per user.
+    pub max_tokens_per_user: usize,
     #[serde(rename = "token")]
     pub tokens: Vec<Token>,
 }
@@ -35,6 +55,10 @@ impl Default for HubConfig {
             tls_key: String::new(),
             socket: String::new(),
             public_url: String::new(),
+            multi_user: false,
+            root_all_access: true,
+            self_service: true,
+            max_tokens_per_user: 20,
             tokens: vec![],
         }
     }
@@ -74,26 +98,59 @@ impl HubConfig {
         Ok(())
     }
 
+    /// The socket `serve` listens on.
     pub fn socket_path(&self) -> PathBuf {
-        socket_path_for(&self.socket)
+        if let Ok(s) = std::env::var("CCC_HUB_SOCK") {
+            return PathBuf::from(s);
+        }
+        if !self.socket.is_empty() {
+            return PathBuf::from(&self.socket);
+        }
+        if self.multi_user {
+            return PathBuf::from(SHARED_SOCK);
+        }
+        dir().join("hub.sock")
     }
+}
 
+/// Socket of a multi-user hub (when `socket` is not set).
+pub const SHARED_SOCK: &str = "/run/ccc-hub/hub.sock";
+
+/// The socket a client (`mcp`, `call`, `token`) should talk to: the one of
+/// this user's own hub config if there is one, else a shared hub's.
+pub fn client_socket() -> PathBuf {
+    if let Ok(s) = std::env::var("CCC_HUB_SOCK") {
+        return PathBuf::from(s);
+    }
+    if path().exists() {
+        if let Ok(c) = HubConfig::load() {
+            return c.socket_path();
+        }
+    }
+    let own = dir().join("hub.sock");
+    if !own.exists() && std::path::Path::new(SHARED_SOCK).exists() {
+        return PathBuf::from(SHARED_SOCK);
+    }
+    own
+}
+
+/// Whether `who` may use the machines of connectors paired with `t`.
+pub fn can_use(t: &Token, who: &Caller, root_all_access: bool) -> bool {
+    if who.admin && (root_all_access || t.owners.is_empty()) {
+        return true;
+    }
+    t.owners.iter().any(|o| who.matches(o))
+}
+
+/// Whether `who` may pair, revoke or share `t`.
+pub fn can_manage(t: &Token, who: &Caller) -> bool {
+    who.admin || (!t.created_by.is_empty() && t.created_by == who.name)
 }
 
 /// The configured token matching `token`, if any.
 pub fn check_token(tokens: &[Token], token: &str) -> Option<Token> {
     let h = hash(token);
     tokens.iter().find(|t| ct_eq(t.sha256.as_bytes(), h.as_bytes())).cloned()
-}
-
-pub fn socket_path_for(configured: &str) -> PathBuf {
-    if let Ok(s) = std::env::var("CCC_HUB_SOCK") {
-        return PathBuf::from(s);
-    }
-    if !configured.is_empty() {
-        return PathBuf::from(configured);
-    }
-    dir().join("hub.sock")
 }
 
 pub fn hash(token: &str) -> String {
@@ -137,6 +194,15 @@ pub fn self_signed(names: Vec<String>) -> Result<(String, String)> {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok((cert.to_string_lossy().into(), key.to_string_lossy().into()))
+}
+
+/// Pairing code for `token` on this hub (None without a public URL).
+pub fn pairing_for(cfg: &HubConfig, token: &str) -> Option<String> {
+    if cfg.public_url.is_empty() {
+        return None;
+    }
+    let fp = if cfg.tls_cert.is_empty() { None } else { cert_fingerprint(&cfg.tls_cert).ok() };
+    Some(pairing_code(&cfg.public_url, token, fp.as_deref()))
 }
 
 /// One-line pairing code for a connector: url + token + pinned cert.

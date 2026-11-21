@@ -27,3 +27,4 @@ rand.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"

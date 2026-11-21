@@ -143,7 +143,7 @@ async fn handle(sock: &Path, session: &Session, msg: Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-async fn ipc(sock: &Path, req: &IpcReq) -> Result<IpcResp> {
+pub async fn ipc(sock: &Path, req: &IpcReq) -> Result<IpcResp> {
     let mut s = UnixStream::connect(sock)
         .await
         .map_err(|e| anyhow!("hub daemon not reachable at {} ({e}); start it with `ccc-hub serve`", sock.display()))?;
@@ -251,7 +251,7 @@ async fn call_text(c: Call<'_>, m: &str, name: &str, a: &Value) -> Result<String
 
 fn machines_text(list: &[Listed]) -> String {
     if list.is_empty() {
-        return "no machines connected (is the connector running on the laptop?)".into();
+        return "no machines connected (is the connector running on the laptop? On a shared hub you see only machines whose token lists you)".into();
     }
     let w = list.iter().map(|l| l.name.len()).max().unwrap_or(0);
     list.iter()
