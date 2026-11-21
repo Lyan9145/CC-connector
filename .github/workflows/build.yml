@@ -6,17 +6,17 @@
 #   ccc-macos.zip            connector    (universal: Apple Silicon + Intel, macOS 11+)
 #
 # When it runs:
-# - push to master / pull request: test + build on all three OSes; the files are
-#   kept as "artifacts" on the run's page for 30 days
+# - pull request: test + build on all three OSes; the files are kept as
+#   "artifacts" on the run's page for 30 days (pushes to master don't build:
+#   a release pushes master and a tag, which would build the same commit twice)
 # - push a tag like v0.4.4: also attach all files to that GitHub release (a draft
 #   release is created if there isn't one yet)
-# - "Run workflow" button on the Actions tab: optionally give an existing release
-#   tag (e.g. v0.4.3) to (re)upload all files to it
+# - "Run workflow" button on the Actions tab: build any branch; optionally give an
+#   existing release tag (e.g. v0.4.3) to (re)upload all files to it
 name: Build
 
 on:
   push:
-    branches: [master]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -30,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  # a newer push to the same branch cancels the older run; tag builds always finish
+  # a newer push to the same pull request cancels the older run; tag builds always finish
   group: build-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
