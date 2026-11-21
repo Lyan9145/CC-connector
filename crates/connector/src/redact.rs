@@ -47,6 +47,7 @@ impl Redactor {
                 Ok(OpOk::Lines { start, total, lines: lines.iter().map(|l| self.text(l)).collect() })
             }
             Ok(OpOk::Text(t)) => Ok(OpOk::Text(self.text(&t))),
+            Ok(OpOk::Image { mime, data, note }) => Ok(OpOk::Image { mime, data, note: self.text(&note) }),
             other => other,
         }
     }

@@ -174,6 +174,8 @@ pub struct Inputs<'a> {
     pub status: &'a HashMap<String, String>,
     pub log: &'a [String],
     pub now: i64,
+    /// machines with a tool call running right now
+    pub busy: &'a std::collections::HashSet<String>,
 }
 
 // ------------------------------------------------------------- the page
@@ -584,7 +586,16 @@ fn machines_list(ui: &mut egui::Ui, pal: &Pal, v: &View, stats: &Stats, inp: &In
         }
         let (dc, sname) = status_col(pal, inp.status.get(m));
         let y1 = rect.top() + 13.0;
-        p.circle_filled(pos2(rect.left() + 14.0, y1), 4.5, dc);
+        let busy = inp.busy.contains(m.as_str());
+        if busy {
+            let t = ui.input(|i| i.time);
+            for k in 0..2 {
+                let ph = ((t * 0.8 + k as f64 * 0.5) % 1.0) as f32;
+                p.circle_stroke(pos2(rect.left() + 14.0, y1), 4.5 + 6.0 * ph, Stroke::new(1.5_f32, pal.accent.gamma_multiply(0.8 * (1.0 - ph))));
+            }
+            ui.ctx().request_repaint();
+        }
+        p.circle_filled(pos2(rect.left() + 14.0, y1), 4.5, if busy { pal.accent } else { dc });
         p.text(pos2(rect.left() + 26.0, y1), Align2::LEFT_CENTER, m, FontId::proportional(13.5), pal.ink);
         let fig = fmt_n(c.calls as u64);
         p.text(pos2(rect.right() - 8.0, y1), Align2::RIGHT_CENTER, &fig, FontId::proportional(13.0), pal.ink);
@@ -598,12 +609,14 @@ fn machines_list(ui: &mut egui::Ui, pal: &Pal, v: &View, stats: &Stats, inp: &In
         p.rect_filled(Rect::from_min_size(full.min, vec2(fw, 6.0)), CornerRadius::same(3), pal.accent);
         let avail = c.availability().map(|a| format!("{:.1}% online", a * 100.0)).unwrap_or_else(|| "no availability data".into());
         let last = stats.last_active.get(m).map(|t| format!("active {}", ago(inp.now - t))).unwrap_or_default();
+        let name_w = ui.painter().layout_no_wrap(m.to_string(), FontId::proportional(13.5), pal.ink).size().x;
+        let info = if busy { "running now".to_string() } else { format!("{avail}   {last}") };
         p.text(
-            pos2(rect.left() + 26.0 + 110.0, y1),
+            pos2(rect.left() + 26.0 + (name_w + 14.0).max(110.0), y1),
             Align2::LEFT_CENTER,
-            format!("{avail}   {last}"),
+            info,
             FontId::proportional(11.5),
-            pal.muted,
+            if busy { pal.accent } else { pal.muted },
         );
         let life = stats.lifetime.get(m).cloned().unwrap_or_default();
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);

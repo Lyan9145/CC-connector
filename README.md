@@ -30,7 +30,7 @@ per machine and per tool, what it may do: allow, ask you first, or deny.
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub)
   - [2. Laptop: the connector](#2-laptop-the-connector)
-  - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions))
+  - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
 - [Agent tools reference](#agent-tools-reference)
 - [Security model](#security-model)
@@ -215,22 +215,40 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 
 - **Connections:** your machines. The dot shows each one's status (green online, amber
   connecting, red error, grey hidden/paused); hover for the detail. A red dot is a **retry
-  button**: hover it and it turns into a retry arrow, click to reconnect now. The switch on the
-  right shows or hides the machine from the agent in one click.
-- **Top badge:** when it says **OFFLINE**, click it to reconnect to the hub immediately instead of
-  waiting for the next automatic retry.
+  button**: hover it and it turns into a retry arrow, click to reconnect now. Blue rings pulse
+  around the dot while the agent is using that machine (hover to see what it runs). The switch on
+  the right shows or hides the machine from the agent in one click.
+- **Top bar:** when the badge says **OFFLINE**, click it to reconnect to the hub immediately
+  instead of waiting for the next automatic retry. While the agent works, an animated
+  **N running** pill appears (click it for details), and **N waiting for you** while approvals
+  are pending.
+- **Closing the window** while tool calls are running (or waiting for your approval) asks first:
+  closing stops the connector, so those calls fail. Background jobs keep running either way.
 - **Hub:** pairing and hub status.
-- **Activity:** analytics of what the agent did, plus the request log (see below). Temporary
-  "allow for 15 min" grants are listed at the top with a **Revoke** button.
+- **Activity:** what is running right now, agent sessions and what they were granted, analytics
+  of what the agent did, and the request log (see below). Temporary "allow for 15 min" grants are
+  listed at the top with a **Revoke** button.
+- **Security:** the [security filters](#security-filters) and recent alerts. The tab turns red
+  with a count when something was flagged.
 - **Approval needed** pop-up: appears (and flashes the taskbar) when the agent uses a tool set to
-  *Ask*. See [Permissions](#permissions).
+  *Ask*, touches an *ask once* folder, or sends something a security filter flagged. See
+  [Permissions](#permissions).
 - **Pause agent access** (top right): instantly hides all machines from the agent and refuses
   requests, without closing anything.
 
 #### The Activity tab
 
-Pick a period (**last 24 hours / 7 days / 30 days**) and optionally one machine; clicking a
-machine in the *Machines* list does the same.
+At the top, while something is happening:
+
+- **Running now:** each tool call in progress: machine, tool, what it does, how long it has been
+  running, with an animated bar. Finished calls turn green and fade out.
+- **Agent sessions:** each Claude Code session that used the connector, with what you allowed it
+  "for this session" (tools and folders). **Revoke** takes that back (the session will ask again).
+  A session's grants end when the Claude Code session exits.
+
+Below that are the analytics. Pick a period (**last 24 hours / 7 days / 30 days**) and optionally
+one machine; clicking a machine in the *Machines* list does the same. Machines in use right now
+pulse there too.
 
 | Part | Shows |
 |---|---|
@@ -264,6 +282,7 @@ with generated sample data, to look at the page before you have history.
 | Init commands | Run before every command, e.g. `source /opt/ros/humble/setup.bash`. |
 | Visible to the agent | Untick to hide the machine completely without deleting it. |
 | Agent access | Allow / Ask / Deny for each tool and for sudo, or pick a preset (see [Permissions](#permissions)). |
+| Folders | Where the file tools may go: a level per folder plus one for everywhere else (see [Folders](#folders)). **Browse…** picks a folder (the Windows folder dialog for this computer, a built-in browser for SSH machines). |
 | Host key | Trusted on first connection and pinned afterwards; *Forget* after reinstalling the machine. |
 
 **Save and test** saves, connects, reports the OS, checks that sudo works, and pins the host key.
@@ -301,11 +320,12 @@ Levels:
 
 - **Allow:** runs without asking.
 - **Ask:** the connector shows an **Approval needed** pop-up with the full command, file path,
-  or edit (old and new text). Choose **Allow** (this request only), **Allow *tool* for 15 min**
-  (no more questions for that tool on that machine; revoke in *Activity*), or **Deny**. With no
-  answer in 2 minutes the request is refused. A multi-file `push`/`pull` is approved once for
-  the whole transfer. When the connector runs without its window (`ccc run`), *Ask* means
-  refused.
+  or edit (old and new text), and which Claude Code session asks. Choose **Allow once** (this
+  request only), **Allow for this session** (no more questions for that tool on that machine
+  until this Claude Code session ends), **Allow *tool* for 15 min** (any session; revoke in
+  *Activity*), or **Deny**. With no answer in 2 minutes the request is refused. A multi-file
+  `push`/`pull` is approved once for the whole transfer. When the connector runs without its
+  window (`ccc run`), *Ask* means refused.
 - **Deny:** always refused. Claude sees `denied:` in the machine list and is told not to try.
 
 Presets: **Full access** (everything allowed, the default), **Ask before changes** (reading and
@@ -322,6 +342,78 @@ robot  online  linux (Ubuntu 22.04.5 LTS)  via lab-pc  [ask: exec,write,edit,pus
 Keep in mind that `exec` can do anything a shell can: allowing `exec` while denying `write`
 does not really stop writes. For a machine Claude should only inspect, use **Read only**, or set
 `exec` to *Ask*.
+
+#### Folders
+
+Folder rules limit where the **file tools** (`read`, `write`, `edit`, `push`, `pull`) may go on a
+machine. Each rule is a folder (sub-folders included) and a level; the most specific rule wins,
+and **Everywhere else** covers the rest:
+
+| Level | Reading | Writing |
+|---|---|---|
+| Read & write | yes | yes |
+| Read; ask to write | yes | asks once per session |
+| Read only | yes | no |
+| Ask once per session | asks once per session | asks once per session |
+| No access | no | no |
+
+With everywhere else at *Read & write* and no other rules (the default) there are no folder
+limits. A typical setup works like Claude Code's working folders: the project *Read & write*, home
+*Read; ask to write*, everywhere else *Ask once per session*.
+
+*Ask once per session* means: the first time a Claude Code session touches the folder, the
+approval pop-up asks you. You choose **which folder** to grant (the file's folder or any parent
+up to the rule's folder), whether writing is allowed too, and **Allow once** / **Allow for this
+session**. Tick **Remember this folder for all sessions** to save it as a rule. Each Claude Code
+session has its own grants, they end when the session exits, and you can revoke them in
+*Activity → Agent sessions*.
+
+Paths are resolved on the machine before they are checked: `~`, `..` and symbolic links are
+followed, so a link inside an allowed folder that points elsewhere is judged by where it points.
+Claude sees the rules in the machine list (`folders: ~/ros_ws: read & write; elsewhere: ask once`).
+
+Folder rules don't limit `exec` or `job`: a shell command can reach any folder. To really keep the
+agent inside some folders, set *Run commands* to *Ask* or *Deny* as well.
+
+#### Security filters
+
+The **Security** tab lists patterns that flag risky requests. Each filter can be **Off**, **Warn
+me** (allowed, but you get an alert and a taskbar flash), **Ask me** (the approval pop-up appears
+with a warning, even if the tool is allowed and even if you allowed it for the session), or
+**Block** (refused; Claude is told it was blocked and not to work around it).
+
+Built-in filters (defaults in brackets):
+
+| Filter | Catches |
+|---|---|
+| Changes this connector's own settings [block] | `ccc add/edit/rm/hub/security/pair` and the connector's config file in commands |
+| Fork bomb [block] | `:(){ :\|:& };:` |
+| Reverse shell [block] | `bash -i >& /dev/tcp/…`, `nc -e`, `socat … exec:` |
+| Crypto miner [block] | xmrig and similar, `stratum+tcp://` |
+| Delete everything [block] | `--no-preserve-root` |
+| Recursive delete of a system or home folder [ask] | `rm -rf /`, `rm -rf ~`, `rm -rf /etc` … |
+| Recursive delete of a drive or system folder (Windows) [ask] | `Remove-Item -Recurse C:\`, `…\Windows`, `…\Users` |
+| Formats or overwrites a disk [ask] | `mkfs`, `dd of=/dev/sdX`, `diskpart`, `Format-Volume` |
+| Downloads and runs a script [ask] | `curl … \| sh`, `iwr … \| iex` |
+| Touches passwords or secret keys [ask] | SSH private keys, cloud credentials, `/etc/shadow`, browser logins (commands and paths) |
+| Turns off security features [ask] | Defender, firewall, SELinux / AppArmor, audit |
+| Creates users or changes passwords [ask] | `useradd`, `passwd`, `net user /add` … |
+| Shuts down or restarts the machine [ask] | `reboot`, `shutdown`, `Stop-Computer` … |
+| Writes system files [ask] | writing under `/etc`, `/usr`, `/boot`, `C:\Windows`, `C:\Program Files` |
+| Changes who can log in [ask] | `authorized_keys`, `sshd_config` |
+| Opens up permissions on system folders [ask] | `chmod -R 777 /`, `chown -R … /etc` |
+| Makes something start automatically [warn] | cron, `systemctl enable`, autostart folders, Run keys, scheduled tasks |
+| Changes shell start-up files [warn] | writing `.bashrc`, `.profile`, PowerShell profiles |
+| Clears logs or shell history [warn] | `history -c`, `wevtutil cl`, truncating `/var/log` |
+
+Filters look at commands (`exec`, `job start`), the paths read or written, and the text written
+into files (so a script containing `curl … | sh` is caught when written, not only when run). Add
+your own with **+ Add filter**: a name, a regular expression (case-insensitive), what to match,
+and the action, e.g. block `ros2\s+topic\s+pub\b.*cmd_vel` on a robot. **Try it** shows which
+filters a command would trigger. Alerts are listed under the filters.
+
+Filters are a safety net, not a sandbox: a determined agent can disguise a command (variables,
+encodings, scripts). Real limits come from the tool permissions and folder rules.
 
 #### Typical setups
 
@@ -404,7 +496,7 @@ The MCP server is called `remote`. All results are plain text, kept short for to
 |---|---|---|
 | `machines` | — | one line per machine, e.g. `robot  online  linux (Ubuntu 22.04.5 LTS)  via laptop  [ask: exec; denied: sudo]`, then the owner's notes indented below it |
 | `exec` | `machine`, `cmd`, `cwd`?, `timeout`? (s, default 120, max 3600), `sudo`? | `exit=<code>` then merged stdout/stderr |
-| `read` | `machine`, `path`, `offset`? (1-based line), `limit`? (default 400) | numbered lines, plus `[lines a-b of n]` when partial |
+| `read` | `machine`, `path`, `offset`? (1-based line), `limit`? (default 400) | numbered lines, plus `[lines a-b of n]` when partial; for an image (PNG, JPEG, GIF, WebP, BMP) the image itself, so Claude can look at it |
 | `write` | `machine`, `path`, `content` | `ok <n> bytes` (parent folders are created) |
 | `edit` | `machine`, `path`, `old`, `new`, `all`? | `ok 1 replacement`; error if `old` is missing or not unique |
 | `push` | `machine`, `src` (server path), `dst` (machine path) | `ok <files> <size>`: copies a file or folder to the machine |
@@ -421,6 +513,11 @@ Output handling:
 - On Windows, PowerShell errors and warnings become single `ERROR: …` / `WARNING: …` lines.
 - Machine names are unique across connectors; if two laptops use the same name, the hub shows
   them as `<connector>/<name>`.
+
+Images are sent as they are when they're at most 1568 pixels on the long side and 3.5 MB;
+larger ones (and BMPs) are scaled down and re-encoded on the laptop first (JPEG, or PNG when they
+have transparency). The text part says what was sent, e.g. `photo.jpg: 4032x3024 JPEG (3.1 MB),
+sent as 1568x1176 JPEG (231 KB)`.
 
 Jobs store their state in `~/.ccc/jobs/` on the target machine. `start` returns the job id and
 the first output after one second; `status` shows the state and last lines; `kill` stops the whole
@@ -451,8 +548,16 @@ process tree.
 - **Permissions are enforced on the laptop.** Each request carries the tool it belongs to, and
   the connector checks it against that machine's settings (a request can't borrow another tool's
   name). The hub and the agent can't change permissions.
-- **You stay in control:** per-tool Allow / Ask / Deny, *Pause agent access*, per-machine
-  *Visible to the agent*, and the *Activity* log.
+- **Folder rules follow links.** Paths are resolved on the machine (`~`, `..`, symbolic links)
+  before the rules are checked.
+- **The agent can't raise its own permissions.** The connector's settings folder can't be read or
+  written through the file tools, and commands that run `ccc` management commands or touch its
+  config are blocked by a security filter (on by default).
+- **Security filters** warn you about, ask you first for, or block risky commands, paths and
+  file contents (see [Security filters](#security-filters)). They catch mistakes and obvious
+  abuse, not a determined attacker.
+- **You stay in control:** per-tool Allow / Ask / Deny, folder rules, per-session grants you can
+  revoke, *Pause agent access*, per-machine *Visible to the agent*, and the *Activity* log.
 
 ---
 
@@ -483,6 +588,10 @@ process tree.
 | `ccc show NAME` | full details: permissions per tool and notes |
 | `ccc forget-hostkey NAME` | accept a new SSH host key on next connect |
 | `ccc pause` · `ccc pause --off` | pause / resume agent access |
+| `ccc security [list]` | list the security filters and their actions |
+| `ccc security set FILTER off\|warn\|ask\|block` | change a filter (built-in id or your filter's name) |
+| `ccc security add NAME 'REGEX' [--on cmd,read,write,content] [--action ask]` · `security rm NAME` | your own filters |
+| `ccc security test 'TEXT' [--on cmd]` · `ccc security enable [--off]` | try a command / turn all filters on or off |
 | `ccc print-systemd` | print a systemd user unit for `ccc run` |
 
 Connection options for `add`/`edit`: `--port N`, `--key FILE`, `--password-auth`, `--password`
@@ -494,6 +603,10 @@ Permission options: `--access full|ask|ask-all|read-only` (preset), then `--allo
 `--ask TOOLS`, `--deny TOOLS`, where TOOLS is a comma list of `exec read write edit push pull job
 sudo` or `all`. These may be repeated and apply after the preset. `--sudo` / `--no-sudo` are
 short for `--allow sudo` / `--deny sudo`.
+
+Folder options: `--folder LEVEL=PATH` (repeatable; levels `full`, `read-ask`, `read`, `ask`,
+`deny`; `none=PATH` removes the rule) and `--elsewhere LEVEL`, e.g.
+`ccc edit robot --folder full=~/ros_ws --folder read-ask=~ --elsewhere ask`.
 
 ---
 
@@ -531,7 +644,11 @@ short for `--allow sudo` / `--deny sudo`.
 | "sudo FAILED" in the test, or sudo errors from the agent | Save the correct sudo password for that machine, and make sure the user is in the `sudo` group. |
 | "needs the owner's approval, but the connector is running without its window" | That tool is set to *Ask* and nobody can answer. Open the GUI, or change it to *Allow*. |
 | "the owner of '…' does not allow `…`" | Set to *Deny* in that machine's *Agent access*. |
-| "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.3.x). Update the older one. |
+| "the owner of '…' does not allow reading / writing to …" | Outside the machine's allowed folders (or the folder is *Read only*). Add a folder rule, or change *Everywhere else*. |
+| "blocked by the owner's security filter …" | A filter set to *Block* matched. Check the **Security** tab; change the filter if it was a false alarm. |
+| "could not resolve the path on the machine (it needs GNU realpath)" | Folder rules on an SSH machine need `realpath -m` (coreutils). Install coreutils, or remove the folder rules for that machine. |
+| "the connector's own settings folder is off-limits" | By design: the agent can't touch the connector's config. |
+| "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.4.x). Update the older one. |
 | "OS keyring unavailable" on Linux | Start a desktop session / gnome-keyring, or set `CCC_SECRETS=file`. |
 | Claude Code doesn't show the `remote` tools | Start a new session; check `claude mcp list`. |
 
@@ -542,6 +659,8 @@ short for `--allow sudo` / `--deny sudo`.
 - SSH targets must be Linux/POSIX (bash, coreutils). The laptop itself may be Windows or Linux.
 - No `sudo` on Windows; run the connector as Administrator if needed.
 - Transfers are capped at 500 MB per call; `exec` runs at most one hour (use `job` for longer).
+- Folder rules apply to the file tools only, not to commands; security filters match text
+  patterns and can be evaded.
 - Redaction is best effort (see [Security model](#security-model)).
 
 ---

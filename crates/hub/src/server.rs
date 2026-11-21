@@ -3,7 +3,7 @@
 
 use crate::config::{self, HubConfig, Token};
 use anyhow::{Context, Result};
-use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Tool, Up};
+use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Session, Tool, Up};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +57,7 @@ impl Hub {
         out
     }
 
-    async fn request(&self, machine: &str, op: Op, tool: Tool, call: u64) -> OpResult {
+    async fn request(&self, machine: &str, op: Op, tool: Tool, call: u64, session: Session) -> OpResult {
         let found = self.listed().into_iter().find(|(l, _)| l.name == machine);
         let Some((listed, cid)) = found else {
             let names: Vec<String> = self.listed().into_iter().map(|(l, _)| l.name).collect();
@@ -73,7 +73,7 @@ impl Hub {
         self.pending.lock().unwrap().insert(id, (cid, tx));
         let sent = {
             let conns = self.conns.lock().unwrap();
-            conns.get(&cid).map(|c| c.tx.send(Down::Req { id, machine: listed.info.alias.clone(), op, tool, call }).is_ok())
+            conns.get(&cid).map(|c| c.tx.send(Down::Req { id, machine: listed.info.alias.clone(), op, tool, call, session }).is_ok())
         };
         if sent != Some(true) {
             self.pending.lock().unwrap().remove(&id);
@@ -86,6 +86,13 @@ impl Hub {
                 self.pending.lock().unwrap().remove(&id);
                 Err(format!("no response from connector after {}s", timeout.as_secs()))
             }
+        }
+    }
+
+    /// Tell every connector that an agent session ended.
+    fn end_session(&self, id: u64) {
+        for c in self.conns.lock().unwrap().values() {
+            let _ = c.tx.send(Down::EndSession { id });
         }
     }
 
@@ -170,7 +177,11 @@ pub async fn serve(cfg: HubConfig) -> Result<()> {
                 let Ok(req) = proto::read_frame::<_, IpcReq>(&mut s).await else { return };
                 let resp = match req {
                     IpcReq::Machines => IpcResp::Machines(h.listed().into_iter().map(|(l, _)| l).collect()),
-                    IpcReq::Op { machine, op, tool, call } => IpcResp::Result(h.request(&machine, op, tool, call).await),
+                    IpcReq::Op { machine, op, tool, call, session } => IpcResp::Result(h.request(&machine, op, tool, call, session).await),
+                    IpcReq::EndSession { id } => {
+                        h.end_session(id);
+                        IpcResp::Result(Ok(proto::OpOk::Done { n: 0 }))
+                    }
                 };
                 let _ = proto::write_frame(&mut s, &resp).await;
             });

@@ -169,6 +169,80 @@ impl Perms {
     }
 }
 
+/// What the file tools may do inside a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderAccess {
+    /// Read and write.
+    #[default]
+    Full,
+    /// Read; writing needs the owner's OK once per agent session.
+    ReadAsk,
+    /// Read only.
+    Read,
+    /// Anything needs the owner's OK once per agent session.
+    Ask,
+    /// No access.
+    Deny,
+}
+
+impl FolderAccess {
+    pub const ALL: [FolderAccess; 5] = [FolderAccess::Full, FolderAccess::ReadAsk, FolderAccess::Read, FolderAccess::Ask, FolderAccess::Deny];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            FolderAccess::Full => "full",
+            FolderAccess::ReadAsk => "read-ask",
+            FolderAccess::Read => "read",
+            FolderAccess::Ask => "ask",
+            FolderAccess::Deny => "deny",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<FolderAccess> {
+        FolderAccess::ALL.into_iter().find(|a| a.key() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FolderAccess::Full => "Read & write",
+            FolderAccess::ReadAsk => "Read; ask to write",
+            FolderAccess::Read => "Read only",
+            FolderAccess::Ask => "Ask once per session",
+            FolderAccess::Deny => "No access",
+        }
+    }
+
+    /// Short form for the agent.
+    pub fn agent_label(self) -> &'static str {
+        match self {
+            FolderAccess::Full => "read & write",
+            FolderAccess::ReadAsk => "read; ask once to write",
+            FolderAccess::Read => "read only",
+            FolderAccess::Ask => "ask once",
+            FolderAccess::Deny => "no access",
+        }
+    }
+
+    /// Level for reading (`write` = false) or writing in such a folder.
+    pub fn level(self, write: bool) -> Access {
+        match (self, write) {
+            (FolderAccess::Full, _) | (FolderAccess::ReadAsk | FolderAccess::Read, false) => Access::Allow,
+            (FolderAccess::ReadAsk, true) | (FolderAccess::Ask, _) => Access::Ask,
+            (FolderAccess::Read, true) | (FolderAccess::Deny, _) => Access::Deny,
+        }
+    }
+}
+
+/// A folder and what the file tools may do in it (sub-folders included;
+/// the most specific rule wins).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FolderRule {
+    pub path: String,
+    pub access: FolderAccess,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Connection {
@@ -191,6 +265,11 @@ pub struct Connection {
     pub host_key: String,
     /// What the agent may do on this connection.
     pub perms: Perms,
+    /// Folder rules for the file tools (read/write/edit/push/pull).
+    #[serde(rename = "folder", skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<FolderRule>,
+    /// Access outside all listed folders (Full = no folder limits).
+    pub elsewhere: FolderAccess,
     /// Pre-0.3 config; migrated into `perms.sudo` on load.
     #[serde(skip_serializing)]
     pub allow_sudo: Option<bool>,
@@ -212,6 +291,8 @@ impl Default for Connection {
             enabled: true,
             host_key: String::new(),
             perms: Perms::default(),
+            folders: vec![],
+            elsewhere: FolderAccess::Full,
             allow_sudo: None,
         }
     }
@@ -228,6 +309,97 @@ impl Connection {
             && self.key_path == o.key_path
             && self.host_key == o.host_key
     }
+
+    /// Whether folder rules limit the file tools at all.
+    pub fn has_folder_limits(&self) -> bool {
+        self.elsewhere != FolderAccess::Full || self.folders.iter().any(|f| f.access != FolderAccess::Full)
+    }
+
+    /// Folder rules as told to the agent ("" when there are no limits).
+    pub fn folders_summary(&self) -> String {
+        if !self.has_folder_limits() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = self.folders.iter().map(|f| format!("{}: {}", f.path, f.access.agent_label())).collect();
+        parts.push(format!("elsewhere: {}", self.elsewhere.agent_label()));
+        parts.join("; ")
+    }
+}
+
+/// What a security filter does when it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterAction {
+    Off,
+    /// Allow, but alert the owner.
+    #[default]
+    Warn,
+    /// Always ask the owner first (even if the tool is allowed).
+    Ask,
+    /// Refuse.
+    Block,
+}
+
+impl FilterAction {
+    pub const ALL: [FilterAction; 4] = [FilterAction::Off, FilterAction::Warn, FilterAction::Ask, FilterAction::Block];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            FilterAction::Off => "off",
+            FilterAction::Warn => "warn",
+            FilterAction::Ask => "ask",
+            FilterAction::Block => "block",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<FilterAction> {
+        FilterAction::ALL.into_iter().find(|a| a.key() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterAction::Off => "Off",
+            FilterAction::Warn => "Warn me",
+            FilterAction::Ask => "Ask me",
+            FilterAction::Block => "Block",
+        }
+    }
+}
+
+/// A user-defined security filter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilterRule {
+    pub name: String,
+    /// Regular expression (Rust `regex` syntax).
+    pub pattern: String,
+    /// What it is matched against: "cmd" (exec / job commands), "read"
+    /// (paths read), "write" (paths written), "content" (text written).
+    pub on: Vec<String>,
+    pub action: FilterAction,
+}
+
+impl Default for FilterRule {
+    fn default() -> Self {
+        Self { name: String::new(), pattern: String::new(), on: vec!["cmd".into()], action: FilterAction::Ask }
+    }
+}
+
+/// Security filter settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Security {
+    pub enabled: bool,
+    /// Built-in filter id -> action, where it differs from the default.
+    pub builtin: std::collections::BTreeMap<String, FilterAction>,
+    #[serde(rename = "rule")]
+    pub custom: Vec<FilterRule>,
+}
+
+impl Default for Security {
+    fn default() -> Self {
+        Self { enabled: true, builtin: Default::default(), custom: vec![] }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +415,7 @@ pub struct Config {
     pub paused: bool,
     #[serde(rename = "connection")]
     pub connections: Vec<Connection>,
+    pub security: Security,
 }
 
 impl Config {

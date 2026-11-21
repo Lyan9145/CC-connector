@@ -26,6 +26,18 @@ pub struct MachineInfo {
     pub ask: Vec<String>,
     /// Tools (and "sudo") the owner does not allow on this machine.
     pub denied: Vec<String>,
+    /// Folder rules for the file tools, e.g. "~/proj: read & write; elsewhere: ask"
+    /// (empty = no folder limits).
+    pub folders: String,
+}
+
+/// One agent session (one Claude Code process / MCP shim). Folder access
+/// granted "for this session" is tied to it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Session {
+    pub id: u64,
+    /// For the owner: e.g. "/root/project (started 14:02)".
+    pub label: String,
 }
 
 /// The agent-facing tools that act on a machine. Permissions are granted per
@@ -130,6 +142,14 @@ pub enum OpOk {
     Entries(Vec<Entry>),
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
     Text(String),
+    /// An image returned by `read` (already downscaled for the model).
+    Image {
+        mime: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// e.g. "photo.jpg: 4032x3024 JPEG, sent as 1568x1176 JPEG (212 KB)"
+        note: String,
+    },
 }
 
 pub type OpResult = Result<OpOk, String>;
@@ -148,14 +168,17 @@ pub enum Down {
     Welcome { version: String },
     /// `call` identifies the agent's tool call; one call (e.g. a directory
     /// push) can send many ops and needs only one approval.
-    Req { id: u64, machine: String, op: Op, tool: Tool, call: u64 },
+    Req { id: u64, machine: String, op: Op, tool: Tool, call: u64, session: Session },
+    /// The agent session ended; drop what was granted to it.
+    EndSession { id: u64 },
 }
 
 /// Local IPC (MCP shim -> hub daemon), one request per connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcReq {
     Machines,
-    Op { machine: String, op: Op, tool: Tool, call: u64 },
+    Op { machine: String, op: Op, tool: Tool, call: u64, session: Session },
+    EndSession { id: u64 },
 }
 
 /// A machine as presented to the agent (name may be "connector/alias").
@@ -226,12 +249,14 @@ mod tests {
             op: Op::WriteChunk { path: "/tmp/x".into(), offset: 0, data: vec![0, 1, 255], mode: Some(0o755) },
             tool: Tool::Push,
             call: 9,
+            session: Session { id: 3, label: "x".into() },
         };
         let b = encode(&m);
         let d: Down = decode(&b).unwrap();
         match d {
-            Down::Req { id, op: Op::WriteChunk { data, .. }, .. } => {
+            Down::Req { id, op: Op::WriteChunk { data, .. }, session, .. } => {
                 assert_eq!(id, 7);
+                assert_eq!(session.id, 3);
                 assert_eq!(data, vec![0, 1, 255]);
             }
             _ => panic!(),

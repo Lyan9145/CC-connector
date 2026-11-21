@@ -127,9 +127,17 @@ async fn main() -> Result<()> {
         Cmd::Call { tool, args } => {
             let cfg = HubConfig::load()?;
             let a: serde_json::Value = serde_json::from_str(&args)?;
-            match mcp::call(&cfg.socket_path(), &tool, &a).await {
-                Ok(t) => {
+            match mcp::call(&cfg.socket_path(), &mcp::new_session("ccc-hub call"), &tool, &a).await {
+                Ok(mcp::Reply::Text(t)) => {
                     println!("{t}");
+                    Ok(())
+                }
+                Ok(mcp::Reply::Image { mime, data, note }) => {
+                    // save it so a human (or a test) can look at what the agent would see
+                    let ext = mime.rsplit('/').next().unwrap_or("bin");
+                    let p = std::env::temp_dir().join(format!("ccc-call-image.{ext}"));
+                    std::fs::write(&p, &data)?;
+                    println!("{note}\n[image {mime}, {} bytes, saved to {}]", data.len(), p.display());
                     Ok(())
                 }
                 Err(e) => {

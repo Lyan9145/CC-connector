@@ -85,7 +85,11 @@ async fn run_op(ctx: &Ctx<'_>, op: Op) -> Result<OpOk> {
         Op::Exec { cmd, cwd, timeout, sudo } => exec(ctx, &cmd, ctx.default_cwd(cwd), timeout, sudo).await,
         Op::Read { path, offset, limit } => {
             let data = read_all(ctx, &path).await?;
-            if data.iter().take(8000).any(|&b| b == 0) {
+            let binary = data.iter().take(8000).any(|&b| b == 0) || std::str::from_utf8(&data[..data.len().min(8000)]).is_err_and(|e| e.error_len().is_some());
+            if binary {
+                if let Some(fmt) = sniff_image(&data) {
+                    return tokio::task::spawn_blocking(move || image_op(&path, data, fmt)).await?;
+                }
                 bail!("binary file ({} bytes); use pull to copy it", data.len());
             }
             let text = String::from_utf8_lossy(&data);
@@ -133,6 +137,81 @@ async fn run_op(ctx: &Ctx<'_>, op: Op) -> Result<OpOk> {
         }
         Op::Job(j) => Ok(OpOk::Text(job(ctx, j).await?)),
     }
+}
+
+// ------------------------------------------------------------------ images
+
+/// Longest edge sent to the model (larger images are scaled down anyway).
+const IMG_EDGE: u32 = 1568;
+/// Images up to this size in a model-supported format are sent unchanged.
+const IMG_PASS: usize = 3_500_000;
+
+fn sniff_image(b: &[u8]) -> Option<image::ImageFormat> {
+    use image::ImageFormat as F;
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(F::Png)
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(F::Jpeg)
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some(F::Gif)
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some(F::WebP)
+    } else if b.len() > 26 && b.starts_with(b"BM") {
+        Some(F::Bmp)
+    } else {
+        None
+    }
+}
+
+fn kb(n: usize) -> String {
+    if n >= 1 << 20 { format!("{:.1} MB", n as f64 / (1u64 << 20) as f64) } else { format!("{} KB", n.div_ceil(1024)) }
+}
+
+/// Turn image bytes into what the model can look at: unchanged when small
+/// enough, else scaled to `IMG_EDGE` and re-encoded (PNG if transparent,
+/// otherwise JPEG).
+fn image_op(path: &str, data: Vec<u8>, fmt: image::ImageFormat) -> Result<OpOk> {
+    use image::ImageFormat as F;
+    use std::io::Cursor;
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+    let fname = |f: F| match f {
+        F::Png => "PNG",
+        F::Jpeg => "JPEG",
+        F::Gif => "GIF",
+        F::WebP => "WebP",
+        F::Bmp => "BMP",
+        _ => "image",
+    };
+    let (w, h) = image::ImageReader::with_format(Cursor::new(&data), fmt).into_dimensions().context("unreadable image")?;
+    let supported = matches!(fmt, F::Png | F::Jpeg | F::Gif | F::WebP);
+    if supported && w.max(h) <= IMG_EDGE && data.len() <= IMG_PASS {
+        let note = format!("{name}: {w}x{h} {} ({})", fname(fmt), kb(data.len()));
+        return Ok(OpOk::Image { mime: fmt.to_mime_type().to_string(), note, data });
+    }
+    let img = image::ImageReader::with_format(Cursor::new(&data), fmt).decode().context("unreadable image")?;
+    let img = if w.max(h) > IMG_EDGE { img.resize(IMG_EDGE, IMG_EDGE, image::imageops::FilterType::Triangle) } else { img };
+    let (nw, nh) = (img.width(), img.height());
+    // PNG keeps transparency and sharp text (screenshots); JPEG is far
+    // smaller for photos. Opaque images use whichever is smaller.
+    let mut png = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png), F::Png)?;
+    let alpha = img.color().has_alpha();
+    let (kind, out) = if alpha && png.len() <= IMG_PASS {
+        (F::Png, png)
+    } else {
+        // transparent parts on white
+        let rgba = img.to_rgba8();
+        let rgb = image::RgbImage::from_fn(nw, nh, |x, y| {
+            let p = rgba.get_pixel(x, y).0;
+            let a = p[3] as u32;
+            image::Rgb([0, 1, 2].map(|i| ((p[i] as u32 * a + 255 * (255 - a)) / 255) as u8))
+        });
+        let mut jpg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 85).encode_image(&rgb)?;
+        if !alpha && png.len() <= jpg.len() { (F::Png, png) } else { (F::Jpeg, jpg) }
+    };
+    let note = format!("{name}: {w}x{h} {} ({}), sent as {nw}x{nh} {} ({})", fname(fmt), kb(data.len()), fname(kind), kb(out.len()));
+    Ok(OpOk::Image { mime: kind.to_mime_type().to_string(), note, data: out })
 }
 
 // ------------------------------------------------------------------ exec
@@ -530,6 +609,49 @@ kill -KILL -- -"$1" 2>/dev/null; kill -KILL "$1" 2>/dev/null; exit 0"#;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn images() {
+        // big opaque PNG: scaled down and sent as JPEG
+        // noisy, photo-like content: JPEG is smaller
+        let img = image::RgbImage::from_fn(3000, 2000, |x, y| {
+            let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 7;
+            image::Rgb([(n % 256) as u8, ((n >> 8) % 256) as u8, (x % 256) as u8])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        assert_eq!(sniff_image(&png), Some(image::ImageFormat::Png));
+        let OpOk::Image { mime, data, note } = image_op("/x/big.png", png, image::ImageFormat::Png).unwrap() else { panic!() };
+        assert_eq!(mime, "image/jpeg");
+        assert!(note.starts_with("big.png: 3000x2000 PNG"), "{note}");
+        assert!(note.contains("sent as 1568x1045 JPEG"), "{note}");
+        let back = image::load_from_memory(&data).unwrap();
+        assert_eq!((back.width(), back.height()), (1568, 1045));
+        // small transparent PNG: unchanged
+        let img = image::RgbaImage::from_fn(40, 30, |x, _| image::Rgba([255, 0, 0, (x * 6) as u8]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let n = png.len();
+        let OpOk::Image { mime, data, note } = image_op("C:\\pics\\dot.png", png, image::ImageFormat::Png).unwrap() else { panic!() };
+        assert_eq!((mime.as_str(), data.len()), ("image/png", n));
+        assert!(note.starts_with("dot.png: 40x30 PNG"), "{note}");
+        // BMP is converted to a supported format
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([1, 2, 3]));
+        let mut bmp = Vec::new();
+        image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp).unwrap();
+        assert_eq!(sniff_image(&bmp), Some(image::ImageFormat::Bmp));
+        let OpOk::Image { mime, .. } = image_op("a.bmp", bmp, image::ImageFormat::Bmp).unwrap() else { panic!() };
+        assert_eq!(mime, "image/png"); // flat colour: PNG is the smaller one
+        assert_eq!(sniff_image(b"hello"), None);
+        // flat, screenshot-like content: PNG is smaller and stays sharp
+        let img = image::RgbImage::from_fn(2400, 1600, |x, _| if x % 200 < 100 { image::Rgb([30, 30, 30]) } else { image::Rgb([240, 240, 240]) });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let OpOk::Image { mime, note, .. } = image_op("shot.png", png, image::ImageFormat::Png).unwrap() else { panic!() };
+        assert_eq!(mime, "image/png", "{note}");
+    }
+
     #[test]
     #[ignore]
     fn print_win_job_script() {

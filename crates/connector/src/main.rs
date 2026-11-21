@@ -1,9 +1,11 @@
 #[cfg(feature = "gui")]
 mod analytics;
 mod exec;
+mod filters;
 #[cfg(feature = "gui")]
 mod gui;
 mod ops;
+mod paths;
 mod pin;
 mod redact;
 mod runtime;
@@ -12,7 +14,7 @@ mod store;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use store::{Access, Auth, Connection, Kind, Perm};
+use store::{Access, Auth, Connection, FilterAction, FolderAccess, Kind, Perm};
 
 /// CC-connector: lets Claude Code on your server work on this machine and on
 /// SSH hosts reachable from it. Run without arguments to open the GUI.
@@ -79,9 +81,47 @@ enum Cmd {
     },
     /// Print a systemd user unit for `ccc run`.
     PrintSystemd,
+    /// Security filters: list them, change what they do, or test a command.
+    Security {
+        #[command(subcommand)]
+        cmd: Option<SecCmd>,
+    },
     /// Open the GUI with generated statistics on the Activity tab (design preview).
     #[command(hide = true)]
     Preview,
+}
+
+#[derive(Subcommand)]
+enum SecCmd {
+    /// List the filters and what each does.
+    List,
+    /// Set what a filter does: off, warn, ask or block (built-in id or custom name).
+    Set { filter: String, action: String },
+    /// Turn all filters on or off.
+    Enable {
+        #[arg(long)]
+        off: bool,
+    },
+    /// Add your own filter (a regular expression).
+    Add {
+        name: String,
+        pattern: String,
+        /// What to match: cmd, read, write, content (comma-separated).
+        #[arg(long, default_value = "cmd")]
+        on: String,
+        /// off, warn, ask or block.
+        #[arg(long, default_value = "ask")]
+        action: String,
+    },
+    /// Remove one of your own filters.
+    Rm { name: String },
+    /// Show which filters a command would trigger.
+    Test {
+        text: String,
+        /// Treat the text as: cmd, read, write or content.
+        #[arg(long, default_value = "cmd")]
+        on: String,
+    },
 }
 
 #[derive(Args, Default)]
@@ -138,6 +178,14 @@ struct ConnArgs {
     /// Never allow these.
     #[arg(long, value_name = "TOOLS")]
     deny: Vec<String>,
+    /// Folder rule for the file tools, LEVEL=PATH (repeatable). Levels: full,
+    /// read-ask (read; ask once per session to write), read, ask (ask once per
+    /// session), deny. `none=PATH` removes the rule for PATH.
+    #[arg(long, value_name = "LEVEL=PATH")]
+    folder: Vec<String>,
+    /// Access outside the listed folders (same levels; full = no folder limits).
+    #[arg(long, value_name = "LEVEL")]
+    elsewhere: Option<String>,
     /// Same as --allow sudo.
     #[arg(long)]
     sudo: bool,
@@ -211,6 +259,21 @@ fn apply(c: &mut Connection, o: &ConnArgs) -> Result<()> {
                 c.perms.set(p, level);
             }
         }
+    }
+    for f in &o.folder {
+        let Some((lvl, path)) = f.split_once('=') else { bail!("--folder takes LEVEL=PATH, e.g. full=~/project") };
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            bail!("--folder: empty path");
+        }
+        c.folders.retain(|r| r.path != path);
+        if lvl != "none" {
+            let access = FolderAccess::parse(lvl).with_context(|| format!("unknown folder level '{lvl}' (full, read-ask, read, ask, deny, none)"))?;
+            c.folders.push(store::FolderRule { path, access });
+        }
+    }
+    if let Some(l) = &o.elsewhere {
+        c.elsewhere = FolderAccess::parse(l).with_context(|| format!("unknown folder level '{l}' (full, read-ask, read, ask, deny)"))?;
     }
     if o.sudo {
         c.perms.sudo = Access::Allow;
@@ -428,6 +491,15 @@ fn main() -> Result<()> {
             for p in Perm::ALL {
                 println!("  {:6} {}", p.name(), format!("{:?}", x.perms.get(p)).to_lowercase());
             }
+            if x.has_folder_limits() {
+                println!("folders (file tools):");
+                for f in &x.folders {
+                    println!("  {:22} {}", f.access.label(), f.path);
+                }
+                println!("  {:22} everywhere else", x.elsewhere.label());
+            } else {
+                println!("folders:  no limits");
+            }
             println!("notes for the agent:");
             if x.description.is_empty() {
                 println!("  (none)");
@@ -458,6 +530,7 @@ fn main() -> Result<()> {
             println!("{}", if c.paused { "paused" } else { "resumed" });
             Ok(())
         }
+        Cmd::Security { cmd } => security_cmd(cmd.unwrap_or(SecCmd::List)),
         Cmd::PrintSystemd => {
             let exe = std::env::current_exe()?;
             println!(
@@ -468,6 +541,90 @@ fn main() -> Result<()> {
 [Install]\nWantedBy=default.target",
                 exe.display()
             );
+            Ok(())
+        }
+    }
+}
+
+fn security_cmd(cmd: SecCmd) -> Result<()> {
+    let mut c = store::load()?;
+    let parse_action = |a: &str| FilterAction::parse(a).with_context(|| format!("unknown action '{a}' (off, warn, ask, block)"));
+    let parse_on = |on: &str| -> Result<Vec<String>> {
+        on.split(',')
+            .map(|x| {
+                let x = x.trim();
+                filters::Scope::parse(x).map(|s| s.key().to_string()).with_context(|| format!("unknown target '{x}' (cmd, read, write, content)"))
+            })
+            .collect()
+    };
+    match cmd {
+        SecCmd::List => {
+            println!("security filters are {}", if c.security.enabled { "ON" } else { "OFF (ccc security enable)" });
+            for b in filters::BUILTIN {
+                let a = c.security.builtin.get(b.id).copied().unwrap_or(b.default);
+                let on: Vec<&str> = b.on.iter().map(|s| s.key()).collect();
+                println!("  {:6} {:18} {}  [{}]", a.key(), b.id, b.name, on.join(","));
+            }
+            for r in &c.security.custom {
+                println!("  {:6} {:18} {}  [{}]  /{}/", r.action.key(), "(custom)", r.name, r.on.join(","), r.pattern);
+            }
+            Ok(())
+        }
+        SecCmd::Set { filter, action } => {
+            let a = parse_action(&action)?;
+            if let Some(b) = filters::BUILTIN.iter().find(|b| b.id == filter) {
+                if a == b.default {
+                    c.security.builtin.remove(b.id);
+                } else {
+                    c.security.builtin.insert(b.id.into(), a);
+                }
+            } else if let Some(r) = c.security.custom.iter_mut().find(|r| r.name == filter) {
+                r.action = a;
+            } else {
+                bail!("no filter '{filter}' (see `ccc security list`)");
+            }
+            store::save(&c)?;
+            println!("{filter}: {}", a.label());
+            Ok(())
+        }
+        SecCmd::Enable { off } => {
+            c.security.enabled = !off;
+            store::save(&c)?;
+            println!("security filters {}", if off { "off" } else { "on" });
+            Ok(())
+        }
+        SecCmd::Add { name, pattern, on, action } => {
+            filters::compile(&pattern).map_err(|e| anyhow::anyhow!("bad pattern: {e}"))?;
+            let rule = store::FilterRule { name: name.clone(), pattern, on: parse_on(&on)?, action: parse_action(&action)? };
+            c.security.custom.retain(|r| r.name != name);
+            c.security.custom.push(rule);
+            store::save(&c)?;
+            println!("added filter '{name}'");
+            Ok(())
+        }
+        SecCmd::Rm { name } => {
+            let n = c.security.custom.len();
+            c.security.custom.retain(|r| r.name != name);
+            if n == c.security.custom.len() {
+                bail!("no custom filter '{name}'");
+            }
+            store::save(&c)?;
+            println!("removed filter '{name}'");
+            Ok(())
+        }
+        SecCmd::Test { text, on } => {
+            let scope = filters::Scope::parse(&on).with_context(|| format!("unknown target '{on}'"))?;
+            let (fl, errs) = filters::build(&c.security);
+            for e in errs {
+                eprintln!("warning: {e}");
+            }
+            let hits = filters::check(&fl, &[(scope, text)]);
+            if hits.is_empty() {
+                println!("no filter matches");
+            }
+            for h in hits {
+                println!("{:6} {}  (matched `{}`)", h.action.key(), h.name, h.matched);
+            }
             Ok(())
         }
     }

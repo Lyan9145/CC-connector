@@ -3,7 +3,7 @@
 
 use crate::format;
 use anyhow::{anyhow, bail, Context, Result};
-use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, Op, OpOk, Tool, CHUNK};
+use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, Op, OpOk, Session, Tool, CHUNK};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +19,9 @@ hidden by design. Use sudo=true (never `sudo` inside cmd) for root. Use `job` fo
 running longer than a couple of minutes. push/pull copy between THIS server's filesystem and a machine. \
 Text indented under a machine in `machines` is its owner's notes: follow them when working on it. \
 `ask:` tools wait for the owner to approve each use (may take a minute or be refused); \
-`denied:` tools are unavailable there, so don't try them or work around them.";
+`denied:` tools are unavailable there, so don't try them or work around them. \
+`folders:` limits where the file tools (read/write/edit/push/pull) may go; folders marked \
+`ask once` prompt the owner the first time this session touches them. `read` also shows images.";
 
 fn tools() -> Value {
     let m = json!({"type":"string","description":"machine name from `machines`"});
@@ -31,7 +33,7 @@ fn tools() -> Value {
             "cwd":{"type":"string","description":"default: machine's configured dir"},
             "timeout":{"type":"integer","description":"seconds, default 120, max 3600"},
             "sudo":{"type":"boolean","description":"run whole cmd as root; password is supplied for you"}}}},
-        {"name":"read","description":"Read a text file with line numbers.",
+        {"name":"read","description":"Read a text file with line numbers, or look at an image (png, jpg, gif, webp, bmp).",
          "inputSchema":{"type":"object","required":["machine","path"],"properties":{
             "machine":m,"path":{"type":"string"},
             "offset":{"type":"integer","description":"1-based first line"},
@@ -56,7 +58,31 @@ fn tools() -> Value {
     ])
 }
 
+/// What one tool call returns to the agent.
+pub enum Reply {
+    Text(String),
+    Image { mime: String, data: Vec<u8>, note: String },
+}
+
+impl From<String> for Reply {
+    fn from(s: String) -> Self {
+        Reply::Text(s)
+    }
+}
+
+/// A new session id for this agent process; its label tells the owner
+/// which Claude Code session is asking.
+pub fn new_session(kind: &str) -> Session {
+    let dir = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let when = chrono::Local::now().format("%H:%M");
+    let label = if dir.is_empty() { format!("{kind} started {when}") } else { format!("{dir} ({kind}, started {when})") };
+    // CCC_SESSION_ID lets several `ccc-hub call`s share one session (testing)
+    let id = std::env::var("CCC_SESSION_ID").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| rand::random::<u64>() | 1);
+    Session { id, label }
+}
+
 pub async fn run(sock: PathBuf) -> Result<()> {
+    let session = Arc::new(new_session("agent"));
     let sock = Arc::new(sock);
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -69,8 +95,9 @@ pub async fn run(sock: PathBuf) -> Result<()> {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
         let sock = sock.clone();
         let out = out.clone();
+        let session = session.clone();
         tasks.spawn(async move {
-            if let Some(resp) = handle(&sock, msg).await {
+            if let Some(resp) = handle(&sock, &session, msg).await {
                 let mut s = serde_json::to_string(&resp).unwrap();
                 s.push('\n');
                 let mut o = out.lock().await;
@@ -79,12 +106,13 @@ pub async fn run(sock: PathBuf) -> Result<()> {
             }
         });
     }
-    // stdin closed: finish in-flight requests before exiting
+    // stdin closed: finish in-flight requests, then release this session's grants
     while tasks.join_next().await.is_some() {}
+    let _ = ipc(&sock, &IpcReq::EndSession { id: session.id }).await;
     Ok(())
 }
 
-async fn handle(sock: &Path, msg: Value) -> Option<Value> {
+async fn handle(sock: &Path, session: &Session, msg: Value) -> Option<Value> {
     let id = msg.get("id")?.clone(); // notifications have no id
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(json!({}));
@@ -100,11 +128,15 @@ async fn handle(sock: &Path, msg: Value) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let (text, is_err) = match call(sock, &name, &args).await {
-                Ok(t) => (t, false),
-                Err(e) => (format!("error: {e:#}"), true),
-            };
-            json!({"content": [{"type": "text", "text": text}], "isError": is_err})
+            match call(sock, session, &name, &args).await {
+                Ok(Reply::Text(t)) => json!({"content": [{"type": "text", "text": t}], "isError": false}),
+                Ok(Reply::Image { mime, data, note }) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    json!({"content": [{"type": "text", "text": note}, {"type": "image", "data": b64, "mimeType": mime}], "isError": false})
+                }
+                Err(e) => json!({"content": [{"type": "text", "text": format!("error: {e:#}")}], "isError": true}),
+            }
         }
         _ => return Some(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("unknown method {method}")}})),
     };
@@ -124,12 +156,14 @@ async fn ipc(sock: &Path, req: &IpcReq) -> Result<IpcResp> {
 #[derive(Clone, Copy)]
 struct Call<'a> {
     sock: &'a Path,
+    session: &'a Session,
     tool: Tool,
     id: u64,
 }
 
 async fn op(c: Call<'_>, machine: &str, op: Op) -> Result<OpOk> {
-    match ipc(c.sock, &IpcReq::Op { machine: machine.into(), op, tool: c.tool, call: c.id }).await? {
+    let req = IpcReq::Op { machine: machine.into(), op, tool: c.tool, call: c.id, session: c.session.clone() };
+    match ipc(c.sock, &req).await? {
         IpcResp::Result(r) => r.map_err(|e| anyhow!(e)),
         _ => bail!("unexpected hub response"),
     }
@@ -156,28 +190,33 @@ fn text(r: OpOk) -> String {
     }
 }
 
-pub async fn call(sock: &Path, name: &str, a: &Value) -> Result<String> {
+pub async fn call(sock: &Path, session: &Session, name: &str, a: &Value) -> Result<Reply> {
     if name == "machines" {
         let IpcResp::Machines(list) = ipc(sock, &IpcReq::Machines).await? else { bail!("unexpected hub response") };
-        return Ok(machines_text(&list));
+        return Ok(machines_text(&list).into());
     }
     let m = s(a, "machine")?;
     let tool = Tool::parse(name).with_context(|| format!("unknown tool '{name}'"))?;
-    let c = Call { sock, tool, id: rand::random() };
+    let c = Call { sock, session, tool, id: rand::random() };
+    if name == "read" {
+        let offset = n(a, "offset").unwrap_or(1).max(1) as usize;
+        let limit = n(a, "limit").unwrap_or(400).clamp(1, 5000) as usize;
+        return Ok(match op(c, m, Op::Read { path: s(a, "path")?.into(), offset, limit }).await? {
+            OpOk::Lines { start, total, lines } => format::numbered(start, total, &lines).into(),
+            OpOk::Image { mime, data, note } => Reply::Image { mime, data, note },
+            o => text(o).into(),
+        });
+    }
+    call_text(c, m, name, a).await.map(Reply::Text)
+}
+
+async fn call_text(c: Call<'_>, m: &str, name: &str, a: &Value) -> Result<String> {
     match name {
         "exec" => {
             let timeout = n(a, "timeout").unwrap_or(120).clamp(1, 3600);
             let r = op(c, m, Op::Exec { cmd: s(a, "cmd")?.into(), cwd: os(a, "cwd"), timeout, sudo: b(a, "sudo") }).await?;
             match r {
                 OpOk::Exec { code, out, timed_out } => Ok(format::exec_result(m, code, &out, timed_out, timeout)),
-                o => Ok(text(o)),
-            }
-        }
-        "read" => {
-            let offset = n(a, "offset").unwrap_or(1).max(1) as usize;
-            let limit = n(a, "limit").unwrap_or(400).clamp(1, 5000) as usize;
-            match op(c, m, Op::Read { path: s(a, "path")?.into(), offset, limit }).await? {
-                OpOk::Lines { start, total, lines } => Ok(format::numbered(start, total, &lines)),
                 o => Ok(text(o)),
             }
         }
@@ -230,6 +269,9 @@ fn machines_text(list: &[Listed]) -> String {
             }
             if !acc.is_empty() {
                 s.push_str(&format!("  [{}]", acc.join("; ")));
+            }
+            if !l.info.folders.is_empty() {
+                s.push_str(&format!("\n    folders: {}", l.info.folders));
             }
             for line in l.info.description.trim_end().lines() {
                 s.push_str("\n    ");
