@@ -4,6 +4,8 @@ mod exec;
 mod filters;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod i18n;
 mod ops;
 mod paths;
 mod netif;

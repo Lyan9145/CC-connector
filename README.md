@@ -209,6 +209,16 @@ up the tools; already-running sessions do not.
 
 The connector is active **while it runs**: closing the window disconnects all machines.
 
+#### Language
+
+The window follows the system language and is translated into English, 简体中文, 繁體中文,
+日本語, 한국어, Español, Français, Deutsch, Português (Brasil) and Русский. Pick another one
+from the 🌐 menu at the right end of the tab row; the choice is saved and applies right away.
+Chinese, Japanese and Korean text uses the fonts already on the computer (Microsoft YaHei /
+JhengHei, Yu Gothic, Malgun Gothic on Windows; Hiragino / Apple SD Gothic on macOS; Noto Sans
+CJK, WenQuanYi or Droid Sans Fallback on Linux). If none is found, point `CCC_FONT` at a font
+file. The command line, the logs and messages that come from the system stay in English.
+
 #### Pair with the hub
 
 **Hub** tab → *Quick setup* → paste the pairing code → **Pair**.
@@ -705,6 +715,7 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 |---|---|
 | `CCC_SECRETS=file` | connector stores secrets in a `0600` file (`secrets.toml` next to the config) instead of the keyring; for headless Linux without a Secret Service |
 | `CCC_DIR` | connector config directory |
+| `CCC_FONT=path[#face]` | font with Chinese / Japanese / Korean glyphs for the window, tried before the system fonts (`#face` picks a face in a `.ttc` collection) |
 | `CCC_HUB_DIR`, `CCC_HUB_SOCK` | hub config directory / socket path |
 
 ---

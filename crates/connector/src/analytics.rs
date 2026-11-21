@@ -5,6 +5,7 @@
 //! volume = blue accent, failed = critical red, refused = warning amber;
 //! availability is magnitude, so it uses one blue ramp (no red/green pair).
 
+use crate::i18n::{self, tf, tr};
 use crate::stats::{Counts, Range, Stats, View};
 use ccc_proto::Tool;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind};
@@ -127,10 +128,10 @@ fn fmt_ms(ms: u64) -> String {
 
 fn ago(secs: i64) -> String {
     match secs {
-        s if s < 90 => "just now".into(),
-        s if s < 3600 => format!("{} min ago", s / 60),
-        s if s < 86_400 => format!("{} h ago", s / 3600),
-        s => format!("{} d ago", s / 86_400),
+        s if s < 90 => tr("just now").into(),
+        s if s < 3600 => tf!("{n} min ago", n = s / 60),
+        s if s < 86_400 => tf!("{n} h ago", n = s / 3600),
+        s => tf!("{n} d ago", n = s / 86_400),
     }
 }
 
@@ -142,9 +143,10 @@ fn bucket_label(v: &View, i: usize) -> String {
     let a = local(v.start_hour + i as i64 * v.bucket_hours);
     let b = local(v.start_hour + (i as i64 + 1) * v.bucket_hours);
     match v.bucket_hours {
-        1 => format!("{}  {}–{}", a.format("%a %b %-d"), a.format("%H:00"), b.format("%H:00")),
-        24 => a.format("%a %b %-d").to_string(),
-        _ => format!("{}  {}–{}", a.format("%a %b %-d"), a.format("%H:00"), b.format("%H:00")),
+        // date formats are translated too (month and day names would be English)
+        1 => format!("{}  {}–{}", a.format(tr("%a %b %-d")), a.format("%H:00"), b.format("%H:00")),
+        24 => a.format(tr("%a %b %-d")).to_string(),
+        _ => format!("{}  {}–{}", a.format(tr("%a %b %-d")), a.format("%H:00"), b.format("%H:00")),
     }
 }
 
@@ -191,7 +193,7 @@ pub fn page(ui: &mut egui::Ui, st: &mut PageState, stats: &Stats, inp: &Inputs) 
     // filter row
     ui.horizontal(|ui| {
         for r in [Range::Day, Range::Week, Range::Month] {
-            if ui.selectable_label(st.range == r, egui::RichText::new(format!("Last {}", r.label())).size(13.5)).clicked() {
+            if ui.selectable_label(st.range == r, egui::RichText::new(range_title(r)).size(13.5)).clicked() {
                 st.range = r;
             }
         }
@@ -204,16 +206,16 @@ pub fn page(ui: &mut egui::Ui, st: &mut PageState, stats: &Stats, inp: &Inputs) 
         }
         names.sort();
         egui::ComboBox::from_id_salt("focus")
-            .selected_text(st.focus.clone().unwrap_or_else(|| "All machines".into()))
+            .selected_text(st.focus.clone().unwrap_or_else(|| tr("All machines").into()))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut st.focus, None, "All machines");
+                ui.selectable_value(&mut st.focus, None, tr("All machines"));
                 for n in names {
                     ui.selectable_value(&mut st.focus, Some(n.clone()), n);
                 }
             });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let armed = st.confirm_clear.is_some_and(|t| t.elapsed().as_secs() < 4);
-            let label = if armed { "Click again to clear all statistics" } else { "Clear statistics" };
+            let label = if armed { tr("Click again to clear all statistics") } else { tr("Clear statistics") };
             if ui.small_button(label).clicked() {
                 if armed {
                     action = Some(Action::ClearStats);
@@ -231,40 +233,40 @@ pub fn page(ui: &mut egui::Ui, st: &mut PageState, stats: &Stats, inp: &Inputs) 
 
     card(ui, &pal, |ui| {
         let per = match view.bucket_hours {
-            1 => "per hour",
-            24 => "per day",
-            _ => "per 6 hours",
+            1 => tr("per hour"),
+            24 => tr("per day"),
+            _ => tr("per 6 hours"),
         };
-        chart_header(ui, &pal, "Requests", per, &[("Succeeded", pal.accent), ("Failed", pal.crit), ("Refused", pal.warn)]);
+        chart_header(ui, &pal, tr("Requests"), per, &[(tr("Succeeded"), pal.accent), (tr("Failed"), pal.crit), (tr("Refused"), pal.warn)]);
         requests_chart(ui, &pal, &view);
     });
     ui.add_space(12.0);
 
     ui.columns(2, |cols| {
         card(&mut cols[0], &pal, |ui| {
-            chart_header(ui, &pal, "Machines", "click one to focus the page on it", &[]);
+            chart_header(ui, &pal, tr("Machines"), tr("click one to focus the page on it"), &[]);
             if let Some(clicked) = machines_list(ui, &pal, &view, stats, inp, st.focus.as_deref()) {
                 st.focus = if st.focus.as_deref() == Some(&clicked) { None } else { Some(clicked) };
             }
         });
         card(&mut cols[1], &pal, |ui| {
-            chart_header(ui, &pal, "Tools", "calls by tool", &[]);
+            chart_header(ui, &pal, tr("Tools"), tr("calls by tool"), &[]);
             tools_list(ui, &pal, &view.total);
         });
     });
     ui.add_space(12.0);
 
     card(ui, &pal, |ui| {
-        chart_header(ui, &pal, "Availability", "share of time each machine was reachable", &[]);
+        chart_header(ui, &pal, tr("Availability"), tr("share of time each machine was reachable"), &[]);
         availability(ui, &pal, &view);
     });
     ui.add_space(12.0);
 
     card(ui, &pal, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Recent activity").strong().size(15.0).color(pal.ink));
+            ui.label(egui::RichText::new(tr("Recent activity")).strong().size(15.0).color(pal.ink));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut st.search).hint_text("filter").desired_width(160.0));
+                ui.add(egui::TextEdit::singleline(&mut st.search).hint_text(tr("filter")).desired_width(160.0));
             });
         });
         log_list(ui, &pal, inp.log, st.focus.as_deref(), &st.search);
@@ -314,24 +316,34 @@ enum Tone {
     Bad,
 }
 
+/// "Last 24 hours" etc. (whole phrases: some languages inflect "last")
+fn range_title(r: Range) -> &'static str {
+    match r {
+        Range::Day => tr("Last 24 hours"),
+        Range::Week => tr("Last 7 days"),
+        Range::Month => tr("Last 30 days"),
+    }
+}
+
 fn kpi_row(ui: &mut egui::Ui, pal: &Pal, v: &View, range: Range) {
     let t = &v.total;
     let p = &v.prev;
-    let vs = format!("vs previous {}", range.label());
-    let delta = |cur: f64, prev: f64, up_good: Option<bool>| -> Option<(String, Tone, bool)> {
+    let range = tr(range.label());
+    // (text, tone, arrow up / down / none)
+    let delta = |cur: f64, prev: f64, up_good: Option<bool>| -> Option<(String, Tone, Option<bool>)> {
         if prev <= 0.0 {
             return None;
         }
         let d = (cur - prev) / prev * 100.0;
         if d.abs() < 0.5 {
-            return Some((format!("no change {vs}"), Tone::Neutral, true));
+            return Some((tf!("no change vs previous {range}", range = range), Tone::Neutral, None));
         }
         let tone = match up_good {
             None => Tone::Neutral,
             Some(g) if (d > 0.0) == g => Tone::Good,
             _ => Tone::Bad,
         };
-        Some((format!("{:.0}% {vs}", d.abs()), tone, d > 0.0))
+        Some((tf!("{pct}% vs previous {range}", pct = format!("{:.0}", d.abs()), range = range), tone, Some(d > 0.0)))
     };
     // sparklines: at most 12 points (merge neighbouring buckets)
     let groups: Vec<Counts> = {
@@ -353,48 +365,48 @@ fn kpi_row(ui: &mut egui::Ui, pal: &Pal, v: &View, range: Range) {
 
     let rate = t.success_rate();
     let rate_prev = p.success_rate();
-    type TileSpec = (String, String, Option<(String, Tone, bool)>, String, Option<Vec<f64>>);
+    type TileSpec = (String, String, Option<(String, Tone, Option<bool>)>, String, Option<Vec<f64>>);
     let tiles: Vec<TileSpec> = vec![
         (
-            "Requests".into(),
+            tr("Requests").into(),
             fmt_n(t.calls as u64),
             delta(t.calls as f64, p.calls as f64, None),
-            format!("{} tool calls by the agent", fmt_n(t.calls as u64)),
+            tf!("{n} tool calls by the agent", n = fmt_n(t.calls as u64)),
             Some(spark_calls),
         ),
         (
-            "Success rate".into(),
+            tr("Success rate").into(),
             rate.map(|r| format!("{:.1}%", r * 100.0)).unwrap_or_else(|| "–".into()),
             match (rate, rate_prev) {
                 (Some(a), Some(b)) if (a - b).abs() >= 0.001 => Some((
-                    format!("{:.1} pts {vs}", ((a - b) * 100.0).abs()),
+                    tf!("{pts} pts vs previous {range}", pts = format!("{:.1}", ((a - b) * 100.0).abs()), range = range),
                     if a > b { Tone::Good } else { Tone::Bad },
-                    a > b,
+                    Some(a > b),
                 )),
                 _ => None,
             },
-            format!("{} failed", fmt_n(t.failed as u64)),
+            tf!("{n} failed", n = fmt_n(t.failed as u64)),
             Some(spark_rate),
         ),
         (
-            "Needed you".into(),
+            tr("Needed you").into(),
             fmt_n(t.asked as u64),
             None,
-            format!("{} approved · {} refused", fmt_n(t.approved as u64), fmt_n(t.refused as u64)),
+            tf!("{a} approved · {r} refused", a = fmt_n(t.approved as u64), r = fmt_n(t.refused as u64)),
             None,
         ),
         (
-            "Data moved".into(),
+            tr("Data moved").into(),
             fmt_bytes(t.up + t.down),
             delta((t.up + t.down) as f64, (p.up + p.down) as f64, None),
-            format!("{} up · {} down", fmt_bytes(t.up), fmt_bytes(t.down)),
+            tf!("{up} up · {down} down", up = fmt_bytes(t.up), down = fmt_bytes(t.down)),
             Some(spark_bytes),
         ),
         (
-            "Typical duration".into(),
+            tr("Typical duration").into(),
             t.quantile_ms(0.5).map(fmt_ms).unwrap_or_else(|| "–".into()),
             None,
-            t.quantile_ms(0.95).map(|x| format!("95% finish within {}", fmt_ms(x))).unwrap_or_default(),
+            t.quantile_ms(0.95).map(|x| tf!("95% finish within {time}", time = fmt_ms(x))).unwrap_or_default(),
             None,
         ),
     ];
@@ -410,7 +422,7 @@ fn kpi_row(ui: &mut egui::Ui, pal: &Pal, v: &View, range: Range) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn tile(ui: &mut egui::Ui, pal: &Pal, w: f32, label: &str, value: &str, delta: Option<(String, Tone, bool)>, sub: &str, spark: Option<&[f64]>) {
+fn tile(ui: &mut egui::Ui, pal: &Pal, w: f32, label: &str, value: &str, delta: Option<(String, Tone, Option<bool>)>, sub: &str, spark: Option<&[f64]>) {
     let (rect, _) = ui.allocate_exact_size(vec2(w, 104.0), Sense::hover());
     let p = ui.painter_at(rect.expand(2.0));
     p.rect_filled(rect, CornerRadius::same(8), pal.tile);
@@ -429,15 +441,15 @@ fn tile(ui: &mut egui::Ui, pal: &Pal, w: f32, label: &str, value: &str, delta: O
             Tone::Bad => pal.bad_text,
         };
         let c = pos2(x + 4.0, y + 7.0);
-        let tri = if up {
+        let tri = if up == Some(true) {
             vec![pos2(c.x - 4.0, c.y + 3.0), pos2(c.x + 4.0, c.y + 3.0), pos2(c.x, c.y - 4.0)]
         } else {
             vec![pos2(c.x - 4.0, c.y - 3.0), pos2(c.x + 4.0, c.y - 3.0), pos2(c.x, c.y + 4.0)]
         };
-        if !text.starts_with("no change") {
+        if up.is_some() {
             p.add(egui::Shape::convex_polygon(tri, col, Stroke::NONE));
         }
-        let tx = if text.starts_with("no change") { x } else { x + 12.0 };
+        let tx = if up.is_none() { x } else { x + 12.0 };
         p.text(pos2(tx, y), Align2::LEFT_TOP, text, FontId::proportional(11.5), col);
         y += 17.0;
     }
@@ -532,8 +544,8 @@ fn requests_chart(ui: &mut egui::Ui, pal: &Pal, v: &View) {
         let t = local(v.start_hour + i as i64 * v.bucket_hours);
         let s = match v.bucket_hours {
             1 => t.format("%H:00").to_string(),
-            6 => t.format("%a %-d").to_string(),
-            _ => t.format("%b %-d").to_string(),
+            6 => t.format(tr("%a %-d")).to_string(),
+            _ => t.format(tr("%b %-d")).to_string(),
         };
         p.text(pos2(plot.left() + band * i as f32, plot.bottom() + 5.0), Align2::LEFT_TOP, s, FontId::proportional(11.0), pal.muted);
     }
@@ -542,13 +554,13 @@ fn requests_chart(ui: &mut egui::Ui, pal: &Pal, v: &View) {
         let label = bucket_label(v, i);
         resp.on_hover_ui_at_pointer(|ui| {
             ui.label(egui::RichText::new(label).strong());
-            for (name, val, col) in [("Succeeded", b.ok, pal.accent), ("Failed", b.failed, pal.crit), ("Refused", b.refused, pal.warn)] {
+            for (name, val, col) in [(tr("Succeeded"), b.ok, pal.accent), (tr("Failed"), b.failed, pal.crit), (tr("Refused"), b.refused, pal.warn)] {
                 ui.horizontal(|ui| {
                     swatch(ui, col);
                     ui.label(format!("{name}  {}", fmt_n(val as u64)));
                 });
             }
-            ui.label(format!("{} request{}", fmt_n(b.calls as u64), if b.calls == 1 { "" } else { "s" }));
+            ui.label(if b.calls == 1 { tr("1 request").to_string() } else { tf!("{n} requests", n = fmt_n(b.calls as u64)) });
         });
     }
 }
@@ -557,11 +569,11 @@ fn requests_chart(ui: &mut egui::Ui, pal: &Pal, v: &View) {
 
 fn status_col(pal: &Pal, s: Option<&String>) -> (Color32, &'static str) {
     match s {
-        Some(s) if s.starts_with("online") => (hex(0x0ca30c), "online"),
-        Some(s) if s.starts_with("connecting") => (pal.warn, "connecting"),
-        Some(s) if s == "disabled" || s == "paused" => (pal.muted, "hidden"),
-        Some(_) => (pal.crit, "error"),
-        None => (pal.muted, "removed"),
+        Some(s) if s.starts_with("online") => (hex(0x0ca30c), tr("online")),
+        Some(s) if s.starts_with("connecting") => (pal.warn, tr("connecting")),
+        Some(s) if s == "disabled" || s == "paused" => (pal.muted, tr("hidden")),
+        Some(_) => (pal.crit, tr("error")),
+        None => (pal.muted, tr("removed")),
     }
 }
 
@@ -569,7 +581,7 @@ fn machines_list(ui: &mut egui::Ui, pal: &Pal, v: &View, stats: &Stats, inp: &In
     let mut rows: Vec<(&String, &Counts)> = v.per_machine.iter().map(|(m, t, _)| (m, t)).collect();
     rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then(a.0.cmp(b.0)));
     if rows.is_empty() {
-        ui.label(egui::RichText::new("No activity in this period.").color(pal.muted));
+        ui.label(egui::RichText::new(tr("No activity in this period.")).color(pal.muted));
         return None;
     }
     let max = rows.iter().map(|r| r.1.calls).max().unwrap_or(1).max(1) as f32;
@@ -607,10 +619,10 @@ fn machines_list(ui: &mut egui::Ui, pal: &Pal, v: &View, stats: &Stats, inp: &In
         p.rect_filled(full, CornerRadius::same(3), pal.wash);
         let fw = (full.width() * c.calls as f32 / max).max(if c.calls > 0 { 3.0 } else { 0.0 });
         p.rect_filled(Rect::from_min_size(full.min, vec2(fw, 6.0)), CornerRadius::same(3), pal.accent);
-        let avail = c.availability().map(|a| format!("{:.1}% online", a * 100.0)).unwrap_or_else(|| "no availability data".into());
-        let last = stats.last_active.get(m).map(|t| format!("active {}", ago(inp.now - t))).unwrap_or_default();
+        let avail = c.availability().map(|a| tf!("{pct}% online", pct = format!("{:.1}", a * 100.0))).unwrap_or_else(|| tr("no availability data").into());
+        let last = stats.last_active.get(m).map(|t| tf!("active {ago}", ago = ago(inp.now - t))).unwrap_or_default();
         let name_w = ui.painter().layout_no_wrap(m.to_string(), FontId::proportional(13.5), pal.ink).size().x;
-        let info = if busy { "running now".to_string() } else { format!("{avail}   {last}") };
+        let info = if busy { tr("running now").to_string() } else { format!("{avail}   {last}") };
         p.text(
             pos2(rect.left() + 26.0 + (name_w + 14.0).max(110.0), y1),
             Align2::LEFT_CENTER,
@@ -622,19 +634,18 @@ fn machines_list(ui: &mut egui::Ui, pal: &Pal, v: &View, stats: &Stats, inp: &In
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         let resp = resp.on_hover_ui(|ui| {
             ui.label(egui::RichText::new(m).strong());
-            ui.label(format!("status: {sname}"));
-            ui.label(format!(
-                "this period: {} requests, {} failed, {} refused",
-                fmt_n(c.calls as u64),
-                fmt_n(c.failed as u64),
-                fmt_n(c.refused as u64)
+            let full = inp.status.get(m).map(|s| i18n::status(s)).unwrap_or_else(|| sname.to_string());
+            ui.label(tf!("status: {status}", status = full));
+            ui.label(tf!(
+                "this period: {n} requests, {failed} failed, {refused} refused",
+                n = fmt_n(c.calls as u64),
+                failed = fmt_n(c.failed as u64),
+                refused = fmt_n(c.refused as u64)
             ));
-            ui.label(format!(
-                "all time: {} requests, {} moved",
-                fmt_n(life.calls as u64),
-                fmt_bytes(life.up + life.down)
-            ));
-            ui.label(egui::RichText::new(if focus == Some(m.as_str()) { "click to show all machines" } else { "click to focus on this machine" }).weak());
+            ui.label(tf!("all time: {n} requests, {bytes} moved", n = fmt_n(life.calls as u64), bytes = fmt_bytes(life.up + life.down)));
+            ui.label(
+                egui::RichText::new(if focus == Some(m.as_str()) { tr("click to show all machines") } else { tr("click to focus on this machine") }).weak(),
+            );
         });
         if resp.clicked() {
             clicked = Some(m.clone());
@@ -661,7 +672,12 @@ fn tools_list(ui: &mut egui::Ui, pal: &Pal, t: &Counts) {
         p.rect_filled(Rect::from_min_size(pos2(x0, cy - 5.0), vec2(w, 10.0)), CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }, pal.accent);
         p.text(pos2(rect.right() - 2.0, cy), Align2::RIGHT_CENTER, fmt_n(n as u64), FontId::proportional(12.5), pal.ink2);
         if total > 0 {
-            resp.on_hover_text(format!("{} {}: {:.0}% of calls", fmt_n(n as u64), tool.name(), n as f32 / total as f32 * 100.0));
+            resp.on_hover_text(tf!(
+                "{n} {tool}: {pct}% of calls",
+                n = fmt_n(n as u64),
+                tool = tool.name(),
+                pct = format!("{:.0}", n as f32 / total as f32 * 100.0)
+            ));
         }
     }
 }
@@ -670,7 +686,7 @@ fn tools_list(ui: &mut egui::Ui, pal: &Pal, t: &Counts) {
 
 fn availability(ui: &mut egui::Ui, pal: &Pal, v: &View) {
     if v.per_machine.is_empty() {
-        ui.label(egui::RichText::new("No data in this period.").color(pal.muted));
+        ui.label(egui::RichText::new(tr("No data in this period.")).color(pal.muted));
         return;
     }
     let n = v.buckets.len();
@@ -701,8 +717,8 @@ fn availability(ui: &mut egui::Ui, pal: &Pal, v: &View) {
             resp.on_hover_ui_at_pointer(|ui| {
                 ui.label(egui::RichText::new(format!("{m} · {label}")).strong());
                 match b.availability() {
-                    Some(a) => ui.label(format!("online {:.0}% ({} of {} min sampled)", a * 100.0, b.online, b.samples)),
-                    None => ui.label("no data (connector was not running)"),
+                    Some(a) => ui.label(tf!("online {pct}% ({n} of {total} min sampled)", pct = format!("{:.0}", a * 100.0), n = b.online, total = b.samples)),
+                    None => ui.label(tr("no data (connector was not running)")),
                 };
             });
         }
@@ -711,7 +727,7 @@ fn availability(ui: &mut egui::Ui, pal: &Pal, v: &View) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(96.0);
-        ui.label(egui::RichText::new("0% online").size(11.5).color(pal.muted));
+        ui.label(egui::RichText::new(tr("0% online")).size(11.5).color(pal.muted));
         for k in 0..6 {
             let (r, _) = ui.allocate_exact_size(vec2(14.0, 10.0), Sense::hover());
             ui.painter().rect_filled(r, CornerRadius::same(2), lerp(pal.seq_lo, pal.seq_hi, k as f32 / 5.0));
@@ -720,7 +736,7 @@ fn availability(ui: &mut egui::Ui, pal: &Pal, v: &View) {
         ui.add_space(12.0);
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 10.0), Sense::hover());
         ui.painter().rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0_f32, pal.grid), StrokeKind::Inside);
-        ui.label(egui::RichText::new("no data").size(11.5).color(pal.muted));
+        ui.label(egui::RichText::new(tr("no data")).size(11.5).color(pal.muted));
     });
     let _ = n;
 }
@@ -738,7 +754,7 @@ fn log_list(ui: &mut egui::Ui, pal: &Pal, log: &[String], focus: Option<&str>, s
         .collect();
     egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
         if lines.is_empty() {
-            ui.label(egui::RichText::new("Nothing yet.").color(pal.muted));
+            ui.label(egui::RichText::new(tr("Nothing yet.")).color(pal.muted));
         }
         for l in lines {
             let col = if l.contains("refused") || l.contains("denied") || l.contains("not approved") {

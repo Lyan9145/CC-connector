@@ -5,6 +5,7 @@
 
 use crate::analytics;
 use crate::filters;
+use crate::i18n::{self, tf, tr};
 use crate::paths;
 use crate::runtime::{self, Answer, Approval, Decision, Running, Runtime, SessionView};
 use crate::store::{self, Access, Auth, Connection, FilterAction, FolderAccess, FolderRule, Kind, Perm, ProxyCfg, ProxyMode};
@@ -207,6 +208,8 @@ struct App {
     guide_hidden: bool,
     /// network adapters, re-read every few seconds while shown
     adapters: (Option<std::time::Instant>, Vec<crate::netif::Adapter>),
+    /// the last "Can't save yet" message (cleared once the fields are fixed)
+    missing_msg: String,
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -229,6 +232,7 @@ pub fn run_with(preview: bool) -> Result<()> {
     detach_console();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tokio = tokio::runtime::Runtime::new()?;
+    i18n::set(&store::load().map(|c| c.lang).unwrap_or_default());
     let rt = {
         let _g = tokio.enter();
         let rt = Runtime::new(false);
@@ -295,12 +299,15 @@ impl App {
             clear_dlg: None,
             guide_hidden: false,
             adapters: (None, vec![]),
+            missing_msg: String::new(),
         }
     }
 }
 
-/// Higher-contrast text than egui's defaults, in both themes.
+/// Higher-contrast text than egui's defaults, in both themes; fonts for
+/// the current language.
 pub(crate) fn setup_style(ctx: &egui::Context) {
+    install_fonts(ctx);
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         let w = &mut s.visuals.widgets;
         w.noninteractive.fg_stroke.color = Color32::from_gray(226);
@@ -322,6 +329,62 @@ pub(crate) fn setup_style(ctx: &egui::Context) {
         s.spacing.button_padding = egui::vec2(10.0, 4.0);
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
     });
+}
+
+/// egui's fonts plus system fonts with Chinese, Japanese and Korean glyphs as
+/// fallbacks (best for the current language first). Missing ones are skipped.
+pub(crate) fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let main = fonts.families.get(&egui::FontFamily::Proportional).and_then(|f| f.first()).and_then(|n| fonts.font_data.get(n));
+    let main = main.and_then(|d| font_metrics(&d.font, d.index)).unwrap_or((0.83, 1.03));
+    for (i, (path, face)) in i18n::cjk_fonts().into_iter().enumerate() {
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        // unreadable files are skipped (egui would panic on them)
+        let Some((ascent, height)) = font_metrics(&bytes, face) else { continue };
+        let name = format!("cjk{i}");
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = face;
+        // egui centres a fallback font's line (line gap included) on the main
+        // font's line; put its baseline on the main font's baseline instead
+        // (Yu Gothic, with a big line gap, would sit a quarter line too high)
+        data.tweak.y_offset_factor = main.0 - ascent - 0.5 * (main.1 - height);
+        fonts.font_data.insert(name.clone(), Arc::new(data));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(fam).or_default().push(name.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// (ascent, line height) of a font in units of its size (ascent - descent,
+/// as egui scales fonts), or None if it can't be read.
+fn font_metrics(data: &[u8], face: u32) -> Option<(f32, f32)> {
+    use ab_glyph::Font;
+    let f = ab_glyph::FontRef::try_from_slice_and_index(data, face).ok()?;
+    let h = f.ascent_unscaled() - f.descent_unscaled();
+    (h > 0.0).then(|| (f.ascent_unscaled() / h, (h + f.line_gap_unscaled()) / h))
+}
+
+/// A translated sentence with highlighted values, for `horizontal_wrapped`:
+/// each `{key}` in `t` becomes the matching rich text.
+fn sentence(ui: &mut egui::Ui, t: &str, parts: &[(&str, RichText)]) {
+    let mut rest = t;
+    while let Some(i) = rest.find('{') {
+        let Some(j) = rest[i..].find('}').map(|j| i + j) else { break };
+        let before = rest[..i].trim();
+        if !before.is_empty() {
+            ui.label(before);
+        }
+        match parts.iter().find(|(k, _)| *k == &rest[i + 1..j]) {
+            Some((_, v)) => ui.label(v.clone()),
+            None => ui.label(&rest[i..=j]),
+        };
+        rest = &rest[j + 1..];
+    }
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        ui.label(rest);
+    }
 }
 
 /// When started by double-click on Windows, hide the console window.
@@ -526,8 +589,8 @@ fn running_card(ui: &mut egui::Ui, running: &[Running]) {
         ui.set_width(ui.available_width());
         let n = running.iter().filter(|r| r.active > 0).count();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Running now").strong().size(15.0));
-            ui.label(RichText::new(format!("{n} tool call{}", if n == 1 { "" } else { "s" })).weak());
+            ui.label(RichText::new(tr("Running now")).strong().size(15.0));
+            ui.label(RichText::new(if n == 1 { tr("1 tool call").to_string() } else { tf!("{n} tool calls", n = n) }).weak());
         });
         for r in running {
             let done = r.active == 0;
@@ -543,10 +606,10 @@ fn running_card(ui: &mut egui::Ui, running: &[Running]) {
                 }
                 ui.label(RichText::new(&r.machine).strong());
                 chip(ui, r.tool.name(), if done { GREEN } else { ACCENT });
-                let elapsed = if done { "done".to_string() } else { fmt_secs(r.started.elapsed()) };
+                let elapsed = if done { tr("done").to_string() } else { fmt_secs(r.started.elapsed()) };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(elapsed).monospace());
-                    ui.add(egui::Label::new(RichText::new(&r.what).monospace().weak()).truncate()).on_hover_text(format!("{}\nsession: {}", r.what, r.session));
+                    ui.add(egui::Label::new(RichText::new(&r.what).monospace().weak()).truncate()).on_hover_text(format!("{}\n{}", r.what, tf!("session: {id}", id = r.session)));
                 });
             });
             busy_bar(ui, ui.available_width(), fade, done);
@@ -560,33 +623,35 @@ fn sessions_card(ui: &mut egui::Ui, sessions: &[SessionView]) -> Option<u64> {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Agent sessions").strong().size(15.0));
-            ui.label(RichText::new("access granted \"for this session\" ends when the session does").weak());
+            ui.label(RichText::new(tr("Agent sessions")).strong().size(15.0));
+            ui.label(RichText::new(tr("access granted \"for this session\" ends when the session does")).weak());
         });
         for s in sessions {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 dot(ui, if s.idle.as_secs() < 300 { ACCENT } else { GREY });
                 ui.add(egui::Label::new(RichText::new(&s.label).strong()).truncate())
-                    .on_hover_text(format!("{}\nstarted {} ago", s.label, fmt_secs(s.age)));
+                    .on_hover_text(format!("{}\n{}", s.label, tf!("started {time} ago", time = fmt_secs(s.age))));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let has = !s.tools.is_empty() || !s.folders.is_empty();
-                    if has && ui.small_button("Revoke").on_hover_text("Take back what this session was allowed; it will ask again").clicked() {
+                    if has && ui.small_button(tr("Revoke")).on_hover_text(tr("Take back what this session was allowed; it will ask again")).clicked() {
                         revoke = Some(s.id);
                     }
-                    ui.label(RichText::new(format!("{} requests · last {} ago", s.requests, fmt_secs(s.idle))).weak());
+                    ui.label(RichText::new(tf!("{n} requests · last {time} ago", n = s.requests, time = fmt_secs(s.idle))).weak());
                 });
             });
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(20.0);
                 if s.tools.is_empty() && s.folders.is_empty() {
-                    ui.label(RichText::new("nothing granted").weak());
+                    ui.label(RichText::new(tr("nothing granted")).weak());
                 }
                 for (m, t, sudo) in &s.tools {
-                    ui.label(RichText::new(format!("{}{} on {m}", t.name(), if *sudo { " (sudo)" } else { "" })).color(AMBER));
+                    let tool = if *sudo { format!("{} (sudo)", t.name()) } else { t.name().to_string() };
+                    ui.label(RichText::new(tf!("{tool} on {machine}", tool = tool, machine = m)).color(AMBER));
                 }
                 for f in &s.folders {
-                    ui.label(RichText::new(format!("{} {} on {}", if f.write { "read & write" } else { "read" }, f.folder, f.machine)).color(AMBER));
+                    let what = if f.write { tf!("read & write {folder}", folder = f.folder) } else { tf!("read {folder}", folder = f.folder) };
+                    ui.label(RichText::new(tf!("{tool} on {machine}", tool = what, machine = f.machine)).color(AMBER));
                 }
             });
         }
@@ -600,10 +665,10 @@ fn approval_window(ctx: &egui::Context, a: &Approval, more: usize, ch: &mut Appr
         *ch = ApprovalChoice { id: a.id, folder: 0, write: a.folder.as_ref().is_some_and(|f| f.write), remember: false };
     }
     let left = a.deadline.saturating_duration_since(std::time::Instant::now()).as_secs();
-    let what = format!("{}{}", a.tool.name(), if a.sudo { " as root (sudo)" } else { "" });
+    let what = if a.sudo { tf!("{tool} as root (sudo)", tool = a.tool.name()) } else { a.tool.name().to_string() };
     let mut answer = None;
     let danger = a.warnings.iter().any(|w| w.action >= FilterAction::Ask);
-    egui::Window::new(RichText::new(if danger { "Approval needed: flagged request" } else { "Approval needed" }).strong())
+    egui::Window::new(RichText::new(if danger { tr("Approval needed: flagged request") } else { tr("Approval needed") }).strong())
         .collapsible(false)
         .resizable(true)
         .default_width(600.0)
@@ -612,18 +677,20 @@ fn approval_window(ctx: &egui::Context, a: &Approval, more: usize, ch: &mut Appr
             ui.horizontal_wrapped(|ui| {
                 match (&a.folder, a.tool_ask || danger) {
                     (Some(f), false) => {
-                        ui.label(format!("The agent wants to {}", if f.write { "write to" } else { "read" }));
-                        ui.label(RichText::new(&f.target).strong().monospace());
+                        let t = if f.write { tr("The agent wants to write to {target} on {machine}") } else { tr("The agent wants to read {target} on {machine}") };
+                        sentence(ui, t, &[("target", RichText::new(&f.target).strong().monospace()), ("machine", RichText::new(&a.machine).strong())]);
                     }
                     _ => {
-                        ui.label("The agent wants to use");
-                        ui.label(RichText::new(&what).strong().color(if a.sudo { RED } else { AMBER }));
+                        let col = if a.sudo { RED } else { AMBER };
+                        sentence(
+                            ui,
+                            tr("The agent wants to use {tool} on {machine}"),
+                            &[("tool", RichText::new(&what).strong().color(col)), ("machine", RichText::new(&a.machine).strong())],
+                        );
                     }
                 }
-                ui.label("on");
-                ui.label(RichText::new(&a.machine).strong());
             });
-            ui.label(RichText::new(format!("session: {}", a.session)).weak().size(12.0));
+            ui.label(RichText::new(tf!("session: {id}", id = a.session)).weak().size(12.0));
             for w in &a.warnings {
                 let col = filter_color(w.action);
                 egui::Frame::new()
@@ -633,9 +700,9 @@ fn approval_window(ctx: &egui::Context, a: &Approval, more: usize, ch: &mut Appr
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(format!("Security filter: {}", w.name)).strong().color(col));
-                        ui.label(&w.why);
-                        ui.label(RichText::new(format!("matched: {}", w.matched)).monospace().size(12.0));
+                        ui.label(RichText::new(tf!("Security filter: {name}", name = tr(&w.name))).strong().color(col));
+                        ui.label(tr(&w.why));
+                        ui.label(RichText::new(tf!("matched: {text}", text = w.matched)).monospace().size(12.0));
                     });
             }
             ui.add_space(4.0);
@@ -647,9 +714,9 @@ fn approval_window(ctx: &egui::Context, a: &Approval, more: usize, ch: &mut Appr
             });
             if let Some(f) = &a.folder {
                 ui.add_space(6.0);
-                ui.label(RichText::new("Folder access").strong());
+                ui.label(RichText::new(tr("Folder access")).strong());
                 ui.horizontal(|ui| {
-                    ui.label("Grant");
+                    ui.label(tr("Grant"));
                     egui::ComboBox::from_id_salt("grant-folder")
                         .width(330.0)
                         .selected_text(RichText::new(f.choices.get(ch.folder).cloned().unwrap_or_default()).monospace())
@@ -659,38 +726,42 @@ fn approval_window(ctx: &egui::Context, a: &Approval, more: usize, ch: &mut Appr
                             }
                         });
                     if f.write {
-                        ui.label("read & write");
+                        ui.label(tr("read & write"));
                     } else {
-                        ui.checkbox(&mut ch.write, "also allow writing");
+                        ui.checkbox(&mut ch.write, tr("also allow writing"));
                     }
                 });
-                ui.checkbox(&mut ch.remember, "Remember this folder for all sessions (adds a folder rule)");
+                ui.checkbox(&mut ch.remember, tr("Remember this folder for all sessions (adds a folder rule)"));
             }
             ui.add_space(6.0);
             let mk = |d: Decision, ch: &ApprovalChoice| Answer { decision: d, folder: ch.folder, write: ch.write, remember: ch.remember };
             ui.horizontal(|ui| {
-                if ui.button(RichText::new(if a.folder.is_some() || a.tool_ask { "Allow once" } else { "Allow" }).strong().color(GREEN)).clicked() {
+                if ui.button(RichText::new(if a.folder.is_some() || a.tool_ask { tr("Allow once") } else { tr("Allow") }).strong().color(GREEN)).clicked() {
                     answer = Some(mk(Decision::Once, ch));
                 }
                 if (a.tool_ask || a.folder.is_some())
-                    && ui.button("Allow for this session").on_hover_text(format!("Until this agent session ends: {}", a.session)).clicked()
+                    && ui.button(tr("Allow for this session")).on_hover_text(tf!("Until this agent session ends: {id}", id = a.session)).clicked()
                 {
                     answer = Some(mk(Decision::Session, ch));
                 }
                 if a.tool_ask
                     && ui
-                        .button(format!("Allow {} for 15 min", a.tool.name()))
-                        .on_hover_text(format!("Don't ask again for `{what}` on {} for 15 minutes (any session)", a.machine))
+                        .button(tf!("Allow {tool} for 15 min", tool = a.tool.name()))
+                        .on_hover_text(tf!("Don't ask again for `{tool}` on {machine} for 15 minutes (any session)", tool = what, machine = a.machine))
                         .clicked()
                 {
                     answer = Some(mk(Decision::For(std::time::Duration::from_secs(15 * 60)), ch));
                 }
-                if ui.button(RichText::new("Deny").strong().color(RED)).clicked() {
+                if ui.button(RichText::new(tr("Deny")).strong().color(RED)).clicked() {
                     answer = Some(mk(Decision::Deny, ch));
                 }
             });
-            let more = if more > 0 { format!("  ·  {more} more waiting") } else { String::new() };
-            ui.label(RichText::new(format!("refused automatically in {left}s{more}")).weak());
+            let mut t = tf!("refused automatically in {n}s", n = left);
+            if more > 0 {
+                t.push_str("  ·  ");
+                t.push_str(&tf!("{n} more waiting", n = more));
+            }
+            ui.label(RichText::new(t).weak());
         });
     answer
 }
@@ -700,16 +771,16 @@ fn folders_editor(ui: &mut egui::Ui, c: &mut Connection) -> Option<usize> {
     let mut browse = None;
     let mut remove = None;
     ui.vertical(|ui| {
-        ui.label(RichText::new("Folders").strong()).on_hover_text("Where the file tools (read, write, edit, push, pull) may go");
+        ui.label(RichText::new(tr("Folders")).strong()).on_hover_text(tr("Where the file tools (read, write, edit, push, pull) may go"));
         for (i, f) in c.folders.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 let te = egui::TextEdit::singleline(&mut f.path).font(egui::TextStyle::Monospace).hint_text("~/project");
                 ui.add_sized([280.0, 22.0], te);
-                if ui.button("Browse…").clicked() {
+                if ui.button(tr("Browse…")).clicked() {
                     browse = Some(i);
                 }
                 folder_combo(ui, ("fa", i), &mut f.access);
-                if ui.small_button("Remove").clicked() {
+                if ui.small_button(tr("Remove")).clicked() {
                     remove = Some(i);
                 }
             });
@@ -718,23 +789,24 @@ fn folders_editor(ui: &mut egui::Ui, c: &mut Connection) -> Option<usize> {
             c.folders.remove(i);
         }
         ui.horizontal(|ui| {
-            if ui.button("+ Add folder").clicked() {
+            if ui.button(tr("+ Add folder")).clicked() {
                 c.folders.push(FolderRule { path: String::new(), access: FolderAccess::ReadAsk });
             }
-            if ui.button("Browse…").on_hover_text("Pick a folder to add").clicked() {
+            if ui.button(tr("Browse…")).on_hover_text(tr("Pick a folder to add")).clicked() {
                 browse = Some(c.folders.len());
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Everywhere else");
+            ui.label(tr("Everywhere else"));
             folder_combo(ui, ("fa", usize::MAX), &mut c.elsewhere);
         });
         let hint = if !c.has_folder_limits() {
-            "No folder limits: the file tools may go anywhere the tool permissions allow.".to_string()
+            tr("No folder limits: the file tools may go anywhere the tool permissions allow.").to_string()
         } else {
-            let mut h = "The most specific folder wins. \"Ask once per session\" pops up the first time each agent session touches the folder.".to_string();
+            let mut h = tr("The most specific folder wins. \"Ask once per session\" pops up the first time each agent session touches the folder.").to_string();
             if c.perms.exec != Access::Deny {
-                h.push_str(" Commands (exec / jobs) can still reach any folder; limit them with the tool permissions.");
+                h.push(' ');
+                h.push_str(tr("Commands (exec / jobs) can still reach any folder; limit them with the tool permissions."));
             }
             h
         };
@@ -744,9 +816,9 @@ fn folders_editor(ui: &mut egui::Ui, c: &mut Connection) -> Option<usize> {
 }
 
 fn folder_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, a: &mut FolderAccess) {
-    egui::ComboBox::from_id_salt(id).width(170.0).selected_text(a.label()).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).width(170.0).selected_text(tr(a.label())).show_ui(ui, |ui| {
         for x in FolderAccess::ALL {
-            ui.selectable_value(a, x, x.label());
+            ui.selectable_value(a, x, tr(x.label()));
         }
     });
 }
@@ -755,30 +827,30 @@ fn folder_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, a: &mut FolderAcces
 fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert], errors: &[String]) -> (bool, bool) {
     let (mut save, mut clear) = (false, false);
     ui.horizontal(|ui| {
-        ui.heading("Security filters");
+        ui.heading(tr("Security filters"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if toggle(ui, st.sec.enabled).on_hover_text("Turn all filters on or off").clicked() {
+            if toggle(ui, st.sec.enabled).on_hover_text(tr("Turn all filters on or off")).clicked() {
                 st.sec.enabled = !st.sec.enabled;
                 st.dirty = true;
             }
-            ui.label(if st.sec.enabled { "Filters on" } else { "Filters off" });
+            ui.label(if st.sec.enabled { tr("Filters on") } else { tr("Filters off") });
         });
     });
     ui.label(
         RichText::new(
-            "Filters look at what the agent asks for and warn you, ask you first, or block it. They are a safety net, \
-             not a sandbox: a determined agent can disguise a command, so keep real limits in the tool and folder permissions.",
+            tr("Filters look at what the agent asks for and warn you, ask you first, or block it. They are a safety net, \
+             not a sandbox: a determined agent can disguise a command, so keep real limits in the tool and folder permissions."),
         )
         .weak(),
     );
     ui.add_space(6.0);
     // try it
     ui.horizontal(|ui| {
-        ui.label("Try it");
+        ui.label(tr("Try it"));
         ui.add(egui::TextEdit::singleline(&mut st.test).desired_width(440.0).font(egui::TextStyle::Monospace).hint_text("curl https://x.sh | sh"));
-        egui::ComboBox::from_id_salt("test-on").selected_text(format!("as {}", st.test_on.label())).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("test-on").selected_text(tf!("as {what}", what = tr(st.test_on.label()))).show_ui(ui, |ui| {
             for x in filters::Scope::ALL {
-                ui.selectable_value(&mut st.test_on, x, x.label());
+                ui.selectable_value(&mut st.test_on, x, tr(x.label()));
             }
         });
     });
@@ -788,23 +860,23 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
         ui.horizontal_wrapped(|ui| {
             ui.add_space(40.0);
             if hits.is_empty() {
-                ui.label(RichText::new("no filter matches").color(GREEN));
+                ui.label(RichText::new(tr("no filter matches")).color(GREEN));
             }
             for h in hits {
-                ui.label(RichText::new(format!("{}: {}", h.action.label(), h.name)).color(filter_color(h.action)).strong());
+                ui.label(RichText::new(format!("{}: {}", tr(h.action.label()), tr(&h.name))).color(filter_color(h.action)).strong());
                 ui.label(RichText::new(format!("(`{}`)", h.matched)).monospace().weak());
             }
         });
     }
     ui.add_space(8.0);
-    ui.label(RichText::new("Built-in").strong().size(15.0));
+    ui.label(RichText::new(tr("Built-in")).strong().size(15.0));
     egui::Grid::new("builtin").num_columns(3).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
         for b in filters::BUILTIN {
             let mut a = st.sec.builtin.get(b.id).copied().unwrap_or(b.default);
             let before = a;
             action_combo(ui, b.id, &mut a);
-            ui.label(b.name).on_hover_text(format!("{}\n\npattern: {}", b.why, b.pattern));
-            let on: Vec<&str> = b.on.iter().map(|s| s.label()).collect();
+            ui.label(tr(b.name)).on_hover_text(format!("{}\n\n{}", tr(b.why), tf!("pattern: {re}", re = b.pattern)));
+            let on: Vec<&str> = b.on.iter().map(|s| tr(s.label())).collect();
             ui.label(RichText::new(on.join(", ")).weak().size(12.0));
             ui.end_row();
             if a != before {
@@ -818,7 +890,7 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
         }
     });
     ui.add_space(8.0);
-    ui.label(RichText::new("Your own").strong().size(15.0));
+    ui.label(RichText::new(tr("Your own")).strong().size(15.0));
     let mut remove = None;
     for (i, r) in st.sec.custom.iter_mut().enumerate() {
         ui.horizontal(|ui| {
@@ -828,20 +900,20 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
                 r.action = a;
                 st.dirty = true;
             }
-            st.dirty |= ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(160.0).hint_text("name")).changed();
+            st.dirty |= ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(160.0).hint_text(tr("name"))).changed();
             let bad = filters::compile(&r.pattern).err();
-            let te = egui::TextEdit::singleline(&mut r.pattern).desired_width(300.0).font(egui::TextStyle::Monospace).hint_text("regular expression");
+            let te = egui::TextEdit::singleline(&mut r.pattern).desired_width(300.0).font(egui::TextStyle::Monospace).hint_text(tr("regular expression"));
             let resp = ui.add(te);
             st.dirty |= resp.changed();
             if let Some(e) = &bad {
                 if !r.pattern.is_empty() {
                     resp.on_hover_text(e.clone());
-                    ui.label(RichText::new("invalid").color(RED));
+                    ui.label(RichText::new(tr("invalid")).color(RED));
                 }
             }
             for sc in filters::Scope::ALL {
                 let mut on = r.on.iter().any(|x| x == sc.key());
-                if ui.checkbox(&mut on, sc.key()).on_hover_text(sc.label()).changed() {
+                if ui.checkbox(&mut on, sc.key()).on_hover_text(tr(sc.label())).changed() {
                     r.on.retain(|x| x != sc.key());
                     if on {
                         r.on.push(sc.key().into());
@@ -849,7 +921,7 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
                     st.dirty = true;
                 }
             }
-            if ui.small_button("Remove").clicked() {
+            if ui.small_button(tr("Remove")).clicked() {
                 remove = Some(i);
             }
         });
@@ -859,15 +931,15 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
         st.dirty = true;
     }
     ui.horizontal(|ui| {
-        if ui.button("+ Add filter").clicked() {
+        if ui.button(tr("+ Add filter")).clicked() {
             st.sec.custom.push(store::FilterRule::default());
             st.dirty = true;
         }
-        if ui.add_enabled(st.dirty, egui::Button::new(RichText::new("Save").strong())).clicked() {
+        if ui.add_enabled(st.dirty, egui::Button::new(RichText::new(tr("Save")).strong())).clicked() {
             save = true;
         }
         if st.dirty {
-            ui.label(RichText::new("unsaved changes").color(AMBER));
+            ui.label(RichText::new(tr("unsaved changes")).color(AMBER));
         }
     });
     for e in errors {
@@ -875,22 +947,22 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
     }
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Recent alerts").strong().size(15.0));
-        if !alerts.is_empty() && ui.small_button("Clear").clicked() {
+        ui.label(RichText::new(tr("Recent alerts")).strong().size(15.0));
+        if !alerts.is_empty() && ui.small_button(tr("Clear")).clicked() {
             clear = true;
         }
     });
     if alerts.is_empty() {
-        ui.label(RichText::new("Nothing flagged yet.").weak());
+        ui.label(RichText::new(tr("Nothing flagged yet.")).weak());
     }
     egui::Grid::new("alerts").num_columns(5).spacing([10.0, 3.0]).striped(true).show(ui, |ui| {
         for a in alerts.iter().rev().take(100) {
             ui.label(RichText::new(&a.time).monospace().weak());
             ui.label(RichText::new(&a.machine).strong());
-            ui.label(RichText::new(&a.hit.name).color(filter_color(a.hit.action))).on_hover_text(format!("{}\nmatched: {}", a.hit.why, a.hit.matched));
+            ui.label(RichText::new(tr(&a.hit.name)).color(filter_color(a.hit.action))).on_hover_text(format!("{}\n{}", tr(&a.hit.why), tf!("matched: {text}", text = a.hit.matched)));
             let what = if a.what.chars().count() > 70 { format!("{}…", a.what.chars().take(70).collect::<String>()) } else { a.what.clone() };
             ui.label(RichText::new(what).monospace()).on_hover_text(&a.what);
-            ui.label(&a.outcome);
+            ui.label(tr(&a.outcome));
             ui.end_row();
         }
     });
@@ -898,9 +970,9 @@ fn security_page(ui: &mut egui::Ui, st: &mut SecState, alerts: &[runtime::Alert]
 }
 
 fn action_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, a: &mut FilterAction) {
-    egui::ComboBox::from_id_salt(id).width(92.0).selected_text(RichText::new(a.label()).color(filter_color(*a))).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).width(92.0).selected_text(RichText::new(tr(a.label())).color(filter_color(*a))).show_ui(ui, |ui| {
         for x in FilterAction::ALL {
-            ui.selectable_value(a, x, RichText::new(x.label()).color(filter_color(x)));
+            ui.selectable_value(a, x, RichText::new(tr(x.label())).color(filter_color(x)));
         }
     });
 }
@@ -917,11 +989,11 @@ fn access_color(a: Access) -> Color32 {
 fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
-            ui.label("Preset");
-            let cur = p.preset().and_then(|k| store::PRESETS.iter().find(|x| x.0 == k)).map(|x| x.1).unwrap_or("Custom");
+            ui.label(tr("Preset"));
+            let cur = p.preset().and_then(|k| store::PRESETS.iter().find(|x| x.0 == k)).map(|x| tr(x.1)).unwrap_or(tr("Custom"));
             egui::ComboBox::from_id_salt("preset").selected_text(cur).show_ui(ui, |ui| {
                 for (_, label, preset) in store::PRESETS {
-                    if ui.selectable_label(*p == preset, label).clicked() {
+                    if ui.selectable_label(*p == preset, tr(label)).clicked() {
                         *p = preset;
                     }
                 }
@@ -929,7 +1001,7 @@ fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
         });
         egui::Grid::new("perms").num_columns(4).spacing([12.0, 3.0]).striped(true).show(ui, |ui| {
             ui.label("");
-            for a in ["Allow", "Ask", "Deny"] {
+            for a in [tr("Allow"), tr("Ask"), tr("Deny")] {
                 ui.label(RichText::new(a).strong());
             }
             ui.end_row();
@@ -938,7 +1010,7 @@ fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
                 let cur = p.get(perm);
                 ui.horizontal(|ui| {
                     dot(ui, if na { GREY } else { access_color(cur) });
-                    ui.label(perm.label()).on_hover_text(format!("agent tool `{}`", perm.name()));
+                    ui.label(tr(perm.label())).on_hover_text(tf!("agent tool `{name}`", name = perm.name()));
                 });
                 for a in [Access::Allow, Access::Ask, Access::Deny] {
                     let mut v = cur;
@@ -948,13 +1020,13 @@ fn perms_editor(ui: &mut egui::Ui, p: &mut store::Perms, windows_local: bool) {
                     }
                 }
                 if na {
-                    ui.label(RichText::new("n/a on Windows").weak());
+                    ui.label(RichText::new(tr("n/a on Windows")).weak());
                 }
                 ui.end_row();
             }
         });
         ui.label(
-            RichText::new("Ask: you approve each use in a pop-up here (refused if this window is closed or headless).")
+            RichText::new(tr("Ask: you approve each use in a pop-up here (refused if this window is closed or headless)."))
                 .weak()
                 .size(12.0),
         );
@@ -1006,28 +1078,29 @@ fn checked(ui: &mut egui::Ui, err: Option<&str>, scroll: bool, add: impl FnOnce(
 fn adapter_section(ui: &mut egui::Ui, id: &str, value: &mut String, adapters: &[crate::netif::Adapter], what: &str) {
     let found = adapters.iter().find(|a| &a.name == value);
     let summary = match (value.is_empty(), found) {
-        (true, _) => "automatic".to_string(),
+        (true, _) => tr("automatic").to_string(),
         (false, Some(a)) if a.up => value.clone(),
-        (false, Some(_)) => format!("{value}, not connected"),
-        (false, None) => format!("{value}, not found"),
+        (false, Some(_)) => tf!("{name}, not connected", name = value),
+        (false, None) => tf!("{name}, not found", name = value),
     };
-    egui::CollapsingHeader::new(RichText::new(format!("Network adapter  ({summary})")).strong())
+    egui::CollapsingHeader::new(RichText::new(format!("{}  ({summary})", tr("Network adapter"))).strong())
         .id_salt(id)
         .default_open(!value.is_empty())
         .show(ui, |ui| {
             ui.label(
-                RichText::new(format!(
+                RichText::new(tf!(
                     "Which network card {what} goes through. Automatic lets the system's routing choose, which is right \
-                     unless two networks overlap or a VPN / TUN mode captures all traffic."
+                     unless two networks overlap or a VPN / TUN mode captures all traffic.",
+                    what = what
                 ))
                 .weak(),
             );
             ui.add_space(2.0);
-            let auto = "Automatic (let the system choose)";
+            let auto = tr("Automatic (let the system choose)");
             let shown = if value.is_empty() {
                 auto.to_string()
             } else {
-                found.map(|a| a.label()).unwrap_or_else(|| format!("{value} (not found)"))
+                found.map(|a| a.label()).unwrap_or_else(|| tf!("{name} (not found)", name = value))
             };
             egui::ComboBox::from_id_salt((id, "combo")).width(440.0).selected_text(shown).show_ui(ui, |ui| {
                 ui.selectable_value(value, String::new(), auto);
@@ -1041,16 +1114,16 @@ fn adapter_section(ui: &mut egui::Ui, id: &str, value: &mut String, adapters: &[
                 (false, Some(a)) if a.up => {
                     if cfg!(target_os = "linux") {
                         ui.label(
-                            RichText::new("On Linux the adapter is only enforced when the connector runs as root; otherwise its address is used and routing decides.")
+                            RichText::new(tr("On Linux the adapter is only enforced when the connector runs as root; otherwise its address is used and routing decides."))
                                 .weak(),
                         );
                     }
                 }
                 (false, Some(_)) => {
-                    ui.label(RichText::new("This adapter is not connected right now, so the connection will fail until it is.").color(AMBER));
+                    ui.label(RichText::new(tr("This adapter is not connected right now, so the connection will fail until it is.")).color(AMBER));
                 }
                 (false, None) => {
-                    ui.label(RichText::new("No adapter with this name right now (unplugged, or renamed?).").color(AMBER));
+                    ui.label(RichText::new(tr("No adapter with this name right now (unplugged, or renamed?).")).color(AMBER));
                 }
             }
         });
@@ -1059,16 +1132,16 @@ fn adapter_section(ui: &mut egui::Ui, id: &str, value: &mut String, adapters: &[
 /// Human name of a form field key, for messages.
 fn field_name(k: &str) -> &'static str {
     match k {
-        "name" => "Name",
-        "host" => "Host",
-        "user" => "User",
-        "key" => "Key file",
-        "password" => "Password",
-        "hub-name" => "Connector name",
-        "url" => "Hub URL",
-        "token" => "Token",
-        "proxy" => "Proxy address",
-        _ => "a field",
+        "name" => tr("Name"),
+        "host" => tr("Host"),
+        "user" => tr("User"),
+        "key" => tr("Key file"),
+        "password" => tr("Password"),
+        "hub-name" => tr("Connector name"),
+        "url" => tr("Hub URL"),
+        "token" => tr("Token"),
+        "proxy" => tr("Proxy address"),
+        _ => tr("a field"),
     }
 }
 
@@ -1141,7 +1214,7 @@ impl App {
                         f.clear_pw = false;
                         f.check = false;
                     }
-                    self.msg = (format!("saved '{name}'"), false);
+                    self.msg = (tf!("saved '{name}'", name = name), false);
                     if then_test {
                         self.start_test(ctx, name);
                     }
@@ -1152,7 +1225,7 @@ impl App {
                 Event::Deleted(name) => {
                     self.busy = false;
                     self.form = None;
-                    self.msg = (format!("deleted '{name}'"), false);
+                    self.msg = (tf!("deleted '{name}'", name = name), false);
                 }
                 Event::Secrets { name, has_pw, has_pp } => {
                     if let Some(f) = self.form.as_mut().filter(|f| f.orig == name) {
@@ -1174,7 +1247,7 @@ impl App {
                     h.proxy.user = h.proxy.user.trim().to_string();
                     h.base = (h.name.clone(), h.url.clone(), h.proxy.clone(), h.iface.clone());
                     h.check = false;
-                    self.msg = ("hub settings saved".into(), false);
+                    self.msg = (tr("hub settings saved").into(), false);
                     if let Some(n) = self.after_save.take() {
                         self.go(ctx, n);
                     }
@@ -1185,7 +1258,7 @@ impl App {
                     self.hub.base.1 = url.clone();
                     self.hub.pair.clear();
                     self.hub.has_token = true;
-                    self.msg = (format!("paired with {url}{}", if pinned { " (certificate pinned)" } else { "" }), false);
+                    self.msg = (if pinned { tf!("paired with {url} (certificate pinned)", url = url) } else { tf!("paired with {url}", url = url) }, false);
                 }
                 Event::Test(r) => {
                     self.busy = false;
@@ -1194,7 +1267,7 @@ impl App {
                 Event::Retried { name, result } => {
                     self.retrying.remove(&name);
                     let err = !result.starts_with("online");
-                    self.msg = (format!("{name}: {result}"), err);
+                    self.msg = (format!("{name}: {}", i18n::status(&result)), err);
                 }
                 Event::Picked { row, path } => {
                     let home = crate::exec::local::home().to_string_lossy().to_string();
@@ -1224,7 +1297,7 @@ impl App {
                 Event::SecuritySaved => {
                     self.busy = false;
                     self.secstate.dirty = false;
-                    self.msg = ("security filters saved".into(), false);
+                    self.msg = (tr("security filters saved").into(), false);
                     if let Some(n) = self.after_save.take() {
                         self.go(ctx, n);
                     }
@@ -1236,23 +1309,23 @@ impl App {
                     if d.what.connections {
                         self.form = None;
                         self.test = None;
-                        gone.push("connections");
+                        gone.push(tr("connections"));
                     }
                     if d.what.hub {
                         self.hub = HubForm::new(&cfg, false, false);
                         self.tab = Tab::Hub;
-                        gone.push("hub settings");
+                        gone.push(tr("hub settings"));
                     }
                     if d.what.security {
                         self.secstate.sec = cfg.security.clone();
                         self.secstate.dirty = false;
-                        gone.push("security settings");
+                        gone.push(tr("security settings"));
                     }
                     if d.activity {
-                        gone.push("statistics and logs");
+                        gone.push(tr("statistics and logs"));
                     }
                     self.guide_hidden = false;
-                    self.msg = (format!("cleared {}", gone.join(", ")), false);
+                    self.msg = (tf!("cleared {what}", what = gone.join(", ")), false);
                 }
             }
         }
@@ -1281,23 +1354,23 @@ impl App {
         let mut v = vec![];
         let name = c.name.trim();
         if name.is_empty() {
-            v.push(("name", "required".into()));
+            v.push(("name", tr("required").into()));
         } else if store::validate_name(name).is_err() {
-            v.push(("name", "use up to 40 letters, digits, '-', '_' or '.'".into()));
+            v.push(("name", tr("use up to 40 letters, digits, '-', '_' or '.'").into()));
         } else if name != f.orig && self.rt.cfg.read().unwrap().get(name).is_some() {
-            v.push(("name", format!("'{name}' is already used")));
+            v.push(("name", tf!("'{name}' is already used", name = name)));
         }
         if c.kind == Kind::Ssh {
             if c.host.trim().is_empty() {
-                v.push(("host", "required".into()));
+                v.push(("host", tr("required").into()));
             }
             if c.user.trim().is_empty() {
-                v.push(("user", "required".into()));
+                v.push(("user", tr("required").into()));
             }
             match c.auth {
-                Auth::Key if c.key_path.trim().is_empty() => v.push(("key", "required for key login".into())),
+                Auth::Key if c.key_path.trim().is_empty() => v.push(("key", tr("required for key login").into())),
                 Auth::Password if f.password.is_empty() && (!f.has_pw || f.clear_pw) => {
-                    v.push(("password", "required for password login".into()))
+                    v.push(("password", tr("required for password login").into()))
                 }
                 _ => {}
             }
@@ -1323,7 +1396,9 @@ impl App {
         self.after_save = None;
         let mut names: Vec<&str> = p.iter().map(|(k, _)| field_name(k)).collect();
         names.dedup();
-        format!("Can't save yet: fill in or fix {}.", names.join(", "))
+        let m = tf!("Can't save yet: fill in or fix {fields}.", fields = names.join(", "));
+        self.missing_msg = m.clone();
+        m
     }
 
     fn save(&mut self, ctx: &egui::Context, then_test: bool) {
@@ -1340,7 +1415,7 @@ impl App {
             }
         };
         if then_test {
-            self.test = Some("saving…".into());
+            self.test = Some(tr("saving…").into());
         }
         self.bg(ctx, move |rt| {
             let r = (|| -> Result<Connection> {
@@ -1379,7 +1454,7 @@ impl App {
     }
 
     fn start_test(&mut self, ctx: &egui::Context, name: String) {
-        self.test = Some(format!("testing '{name}'…"));
+        self.test = Some(tf!("testing '{name}'…", name = name));
         self.busy = true;
         let ev = self.events.clone();
         let rt = self.rt.clone();
@@ -1424,7 +1499,7 @@ impl App {
             });
             let _ = rt.reload();
             match r {
-                Ok(()) => Event::Msg(format!("'{name}' is now {}", if on { "visible to the agent" } else { "hidden from the agent" }), false),
+                Ok(()) => Event::Msg(if on { tf!("'{name}' is now visible to the agent", name = name) } else { tf!("'{name}' is now hidden from the agent", name = name) }, false),
                 Err(e) => Event::Msg(format!("{e:#}"), true),
             }
         });
@@ -1441,14 +1516,14 @@ impl App {
     /// Unsaved changes, if any: which page and how to name them.
     fn dirty(&self) -> Option<(Page, String)> {
         if let Some(f) = self.form.as_ref().filter(|f| f.dirty()) {
-            let what = if f.orig.is_empty() { "the new connection".to_string() } else { format!("connection '{}'", f.orig) };
+            let what = if f.orig.is_empty() { tr("the new connection").to_string() } else { tf!("connection '{name}'", name = f.orig) };
             return Some((Page::Connection, what));
         }
         if self.hub.dirty() {
-            return Some((Page::Hub, "the hub settings".into()));
+            return Some((Page::Hub, tr("the hub settings").into()));
         }
         if self.secstate.dirty {
-            return Some((Page::Security, "the security filters".into()));
+            return Some((Page::Security, tr("the security filters").into()));
         }
         None
     }
@@ -1545,21 +1620,21 @@ impl App {
         let busy = self.busy;
         let r = egui::Modal::new(egui::Id::new("unsaved")).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.label(RichText::new("Save changes?").strong().size(17.0));
+            ui.label(RichText::new(tr("Save changes?")).strong().size(17.0));
             ui.add_space(4.0);
-            ui.label(format!("You changed {what} but haven't saved."));
+            ui.label(tf!("You changed {what} but haven't saved.", what = what));
             if n == Nav::Quit {
-                ui.label(RichText::new("Unsaved changes are lost when the window closes.").weak());
+                ui.label(RichText::new(tr("Unsaved changes are lost when the window closes.")).weak());
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!busy, egui::Button::new(RichText::new("Save").strong())).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new(RichText::new(tr("Save")).strong())).clicked() {
                     choice = Some("save");
                 }
-                if ui.button(RichText::new("Discard changes").color(RED)).clicked() {
+                if ui.button(RichText::new(tr("Discard changes")).color(RED)).clicked() {
                     choice = Some("discard");
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel")).clicked() {
                     choice = Some("cancel");
                 }
             });
@@ -1594,28 +1669,28 @@ impl App {
         let mut choice = None;
         let r = egui::Modal::new(egui::Id::new("clear-data")).show(ctx, |ui| {
             ui.set_width(480.0);
-            ui.label(RichText::new("Clear data?").strong().size(17.0));
+            ui.label(RichText::new(tr("Clear data?")).strong().size(17.0));
             ui.add_space(4.0);
-            ui.label("Remove from this computer:");
-            ui.checkbox(&mut d.what.connections, "Connections, their saved passwords and trusted host keys");
-            ui.checkbox(&mut d.what.hub, "Hub pairing, token and proxy settings");
-            ui.checkbox(&mut d.what.security, "Security filter settings (back to the defaults)");
-            ui.checkbox(&mut d.activity, "Statistics, request log and security alerts");
+            ui.label(tr("Remove from this computer:"));
+            ui.checkbox(&mut d.what.connections, tr("Connections, their saved passwords and trusted host keys"));
+            ui.checkbox(&mut d.what.hub, tr("Hub pairing, token and proxy settings"));
+            ui.checkbox(&mut d.what.security, tr("Security filter settings (back to the defaults)"));
+            ui.checkbox(&mut d.activity, tr("Statistics, request log and security alerts"));
             ui.add_space(4.0);
-            ui.label(RichText::new("This can't be undone. Nothing on your machines or on the hub is touched.").weak());
+            ui.label(RichText::new(tr("This can't be undone. Nothing on your machines or on the hub is touched.")).weak());
             if d.what.hub {
-                ui.label(RichText::new("The connector goes offline until you pair it again.").color(AMBER));
+                ui.label(RichText::new(tr("The connector goes offline until you pair it again.")).color(AMBER));
             }
             if running > 0 && (d.what.connections || d.what.hub) {
-                ui.label(RichText::new(format!("The agent is using your machines right now ({running} running); those calls will fail.")).color(AMBER));
+                ui.label(RichText::new(tf!("The agent is using your machines right now ({n} running); those calls will fail.", n = running)).color(AMBER));
             }
             ui.add_space(10.0);
             let any = d.what.connections || d.what.hub || d.what.security || d.activity;
             ui.horizontal(|ui| {
-                if ui.add_enabled(any, egui::Button::new(RichText::new("Clear selected").strong().color(RED))).clicked() {
+                if ui.add_enabled(any, egui::Button::new(RichText::new(tr("Clear selected")).strong().color(RED))).clicked() {
                     choice = Some(true);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel")).clicked() {
                     choice = Some(false);
                 }
             });
@@ -1663,10 +1738,10 @@ impl App {
         egui::Frame::group(ui.style()).stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.7))).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Getting started").strong().size(16.0));
-                ui.label(RichText::new("three steps to let Claude Code work on your machines").weak());
+                ui.label(RichText::new(tr("Getting started")).strong().size(16.0));
+                ui.label(RichText::new(tr("three steps to let Claude Code work on your machines")).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Hide").on_hover_text("Hide until the connector is restarted").clicked() {
+                    if ui.small_button(tr("Hide")).on_hover_text(tr("Hide until the connector is restarted")).clicked() {
                         self.guide_hidden = true;
                     }
                 });
@@ -1685,33 +1760,37 @@ impl App {
                 });
                 ui.add_space(4.0);
             };
-            step(ui, 0, "Pair with the hub", &mut |ui| {
+            step(ui, 0, tr("Pair with the hub"), &mut |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("On the Claude Code server run");
-                    ui.label(RichText::new("ccc-hub token new <name>").code());
-                    ui.label("and paste the code under Quick setup on the Hub page.");
+                    sentence(
+                        ui,
+                        tr("On the Claude Code server run {cmd} and paste the code under Quick setup on the Hub page."),
+                        &[("cmd", RichText::new("ccc-hub token new <name>").code())],
+                    );
                 });
                 if paired && !online {
-                    ui.label(RichText::new(format!("Paired but not connected: {hs}")).color(AMBER));
+                    ui.label(RichText::new(tf!("Paired but not connected: {status}", status = i18n::status(&hs))).color(AMBER));
                 }
-                if !paired && self.tab != Tab::Hub && ui.button("Open the Hub page").clicked() {
+                if !paired && self.tab != Tab::Hub && ui.button(tr("Open the Hub page")).clicked() {
                     go = Some(Nav::Tab(Tab::Hub));
                 }
             });
-            step(ui, 1, "Add your machines", &mut |ui| {
+            step(ui, 1, tr("Add your machines"), &mut |ui| {
                 ui.label(
-                    "Add this computer (type \"This computer\") and any SSH host it can reach, such as a robot on the \
-                     same network. Choose what the agent may do there and which folders it may use.",
+                    tr("Add this computer (type \"This computer\") and any SSH host it can reach, such as a robot on the \
+                     same network. Choose what the agent may do there and which folders it may use."),
                 );
-                if !has_conn && ui.button("+ Add connection").clicked() {
+                if !has_conn && ui.button(tr("+ Add connection")).clicked() {
                     go = Some(Nav::Open(None));
                 }
             });
-            step(ui, 2, "Use it from Claude Code", &mut |ui| {
+            step(ui, 2, tr("Use it from Claude Code"), &mut |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("On the server run");
-                    ui.label(RichText::new("claude mcp add remote -- ccc-hub mcp").code());
-                    ui.label("once, then ask Claude to list your machines.");
+                    sentence(
+                        ui,
+                        tr("On the server run {cmd} once, then ask Claude to list your machines."),
+                        &[("cmd", RichText::new("claude mcp add remote -- ccc-hub mcp").code())],
+                    );
                 });
             });
         });
@@ -1725,22 +1804,22 @@ impl App {
         let mut v = vec![];
         let name = h.name.trim();
         if name.is_empty() {
-            v.push(("hub-name", "required".into()));
+            v.push(("hub-name", tr("required").into()));
         } else if store::validate_name(name).is_err() {
-            v.push(("hub-name", "use up to 40 letters, digits, '-', '_' or '.'".into()));
+            v.push(("hub-name", tr("use up to 40 letters, digits, '-', '_' or '.'").into()));
         }
         let url = h.url.trim();
         if url.is_empty() {
-            v.push(("url", "required (or use a pairing code above)".into()));
+            v.push(("url", tr("required (or use a pairing code above)").into()));
         } else if !(url.starts_with("wss://") || url.starts_with("ws://")) {
-            v.push(("url", "must start with wss://".into()));
+            v.push(("url", tr("must start with wss://").into()));
         }
         if h.token.trim().is_empty() && !h.has_token {
-            v.push(("token", "required".into()));
+            v.push(("token", tr("required").into()));
         }
         if h.proxy.mode == ProxyMode::Manual {
             if h.proxy.url.trim().is_empty() {
-                v.push(("proxy", "required".into()));
+                v.push(("proxy", tr("required").into()));
             } else if let Err(e) = crate::proxy::parse(&h.proxy.url) {
                 v.push(("proxy", format!("{e:#}")));
             }
@@ -1812,47 +1891,48 @@ impl App {
         let paused_now = self.rt.cfg.read().unwrap().paused;
         ui.horizontal(|ui| {
             let (label, col) = if paused_now {
-                ("PAUSED", GREY)
+                (tr("PAUSED"), GREY)
             } else if hs.starts_with("connected") {
-                ("CONNECTED", GREEN)
+                (tr("CONNECTED"), GREEN)
             } else if hs.starts_with("starting") {
-                ("STARTING", AMBER)
+                (tr("STARTING"), AMBER)
             } else {
-                ("OFFLINE", RED)
+                (tr("OFFLINE"), RED)
             };
-            let offline = label == "OFFLINE";
+            let offline = col == RED;
             let b = badge(ui, label, col, offline);
+            let hub_tip = tf!("hub: {status}", status = i18n::status(&hs));
             if offline {
-                if b.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("hub: {hs}\nClick to reconnect now")).clicked() {
+                if b.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("{hub_tip}\n{}", tr("Click to reconnect now"))).clicked() {
                     self.rt.reconnect_hub();
                 }
             } else {
-                b.on_hover_text(format!("hub: {hs}"));
+                b.on_hover_text(hub_tip);
             }
             let name = self.rt.cfg.read().unwrap().name.clone();
             ui.label(RichText::new(name).strong().size(15.0));
-            let detail = hs.strip_prefix("disconnected: ").unwrap_or(&hs);
+            let detail = hs.strip_prefix("disconnected: ").map(str::to_string).unwrap_or_else(|| i18n::status(&hs));
             if hs.contains("TLS") {
-                ui.label(RichText::new("encrypted").color(GREEN)).on_hover_text(hs.clone());
+                ui.label(RichText::new(tr("encrypted")).color(GREEN)).on_hover_text(hs.clone());
             } else if hs.contains("unencrypted") {
-                ui.label(RichText::new("unencrypted ws://").color(AMBER)).on_hover_text("Use a wss:// URL to encrypt traffic");
+                ui.label(RichText::new(tr("unencrypted ws://")).color(AMBER)).on_hover_text(tr("Use a wss:// URL to encrypt traffic"));
             } else if !hs.starts_with("connected") {
                 ui.label(RichText::new(detail).weak());
             }
             let busy = self.rt.busy();
             let waiting = self.rt.approvals.lock().unwrap().len();
-            if busy > 0 && running_pill(ui, &format!("{busy} running")).on_hover_text("The agent is using your machines; click for details").clicked() {
+            if busy > 0 && running_pill(ui, &tf!("{n} running", n = busy)).on_hover_text(tr("The agent is using your machines; click for details")).clicked() {
                 let ctx = ui.ctx().clone();
                 self.nav(&ctx, Nav::Tab(Tab::Activity));
             }
             if waiting > 0 {
-                badge(ui, &format!("{waiting} waiting for you"), AMBER, false);
+                badge(ui, &tf!("{n} waiting for you", n = waiting), AMBER, false);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut paused = paused_now;
                 if ui
-                    .checkbox(&mut paused, "Pause agent access")
-                    .on_hover_text("While paused the agent sees no machines and all requests are refused")
+                    .checkbox(&mut paused, tr("Pause agent access"))
+                    .on_hover_text(tr("While paused the agent sees no machines and all requests are refused"))
                     .changed()
                 {
                     let ctx = ui.ctx().clone();
@@ -1863,7 +1943,7 @@ impl App {
                         });
                         let _ = rt.reload();
                         match r {
-                            Ok(()) => Event::Msg(if paused { "agent access paused".into() } else { "agent access resumed".into() }, false),
+                            Ok(()) => Event::Msg(if paused { tr("agent access paused").into() } else { tr("agent access resumed").into() }, false),
                             Err(e) => Event::Msg(format!("{e:#}"), true),
                         }
                     });
@@ -1878,9 +1958,9 @@ impl App {
             let unseen = self.rt.alerts_unseen.load(std::sync::atomic::Ordering::Relaxed);
             // sessions currently holding access, plus timed grants
             let granted = self.rt.sessions().iter().filter(|s| !s.tools.is_empty() || !s.folders.is_empty()).count() + self.rt.active_grants().len();
-            for (t, name) in [(Tab::Connections, "Connections"), (Tab::Hub, "Hub"), (Tab::Activity, "Activity"), (Tab::Sessions, "Sessions"), (Tab::Security, "Security")] {
+            for (t, name) in [(Tab::Connections, tr("Connections")), (Tab::Hub, tr("Hub")), (Tab::Activity, tr("Activity")), (Tab::Sessions, tr("Sessions")), (Tab::Security, tr("Security"))] {
                 let label = if t == Tab::Security && unseen > 0 {
-                    RichText::new(format!("{name}  ({unseen} new)")).size(14.5).color(RED)
+                    RichText::new(format!("{name}  ({})", tf!("{n} new", n = unseen))).size(14.5).color(RED)
                 } else if t == Tab::Sessions && granted > 0 {
                     RichText::new(format!("{name}  ({granted})")).size(14.5).color(AMBER)
                 } else {
@@ -1891,13 +1971,47 @@ impl App {
                     self.nav(&ctx, Nav::Tab(t));
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.lang_picker(ui));
+        });
+    }
+
+    /// Window language: follow the OS, or one of `i18n::LANGS`. Saved in the
+    /// config; takes effect at once.
+    fn lang_picker(&mut self, ui: &mut egui::Ui) {
+        let saved = self.rt.cfg.read().unwrap().lang.clone();
+        let auto = tf!("System ({lang})", lang = i18n::system().name);
+        let shown = if saved.is_empty() { auto.clone() } else { i18n::current().name.to_string() };
+        let mut pick = None;
+        egui::ComboBox::from_id_salt("lang").selected_text(format!("🌐 {shown}")).show_ui(ui, |ui| {
+            if ui.selectable_label(saved.is_empty(), auto).clicked() {
+                pick = Some(String::new());
+            }
+            for l in i18n::LANGS {
+                if ui.selectable_label(saved == l.code, l.name).clicked() {
+                    pick = Some(l.code.to_string());
+                }
+            }
+        });
+        let Some(code) = pick.filter(|c| *c != saved) else { return };
+        i18n::set(&code);
+        install_fonts(ui.ctx());
+        self.rt.cfg.write().unwrap().lang = code.clone();
+        let ctx = ui.ctx().clone();
+        self.bg(&ctx, move |_| {
+            match store::load().and_then(|mut c| {
+                c.lang = code;
+                store::save(&c)
+            }) {
+                Ok(()) => Event::Msg(String::new(), false),
+                Err(e) => Event::Msg(format!("{e:#}"), true),
+            }
         });
     }
 
     fn connections(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("list").resizable(true).default_width(240.0).show(ctx, |ui| {
             ui.add_space(6.0);
-            if ui.button("+ Add connection").clicked() {
+            if ui.button(tr("+ Add connection")).clicked() {
                 self.nav(ctx, Nav::Open(None));
             }
             ui.separator();
@@ -1918,26 +2032,28 @@ impl App {
                         let spinning = self.retrying.contains(&c.name);
                         let now: Vec<&Running> = running.iter().filter(|r| r.machine == c.name && r.active > 0).collect();
                         let d = status_dot(ui, status_color(&s), failed, spinning, !now.is_empty());
+                        let shown = i18n::status(&s);
                         let d = if failed {
-                            d.on_hover_text(format!("{s}\nClick to retry"))
+                            d.on_hover_text(format!("{shown}\n{}", tr("Click to retry")))
                         } else if !now.is_empty() {
-                            let lines: Vec<String> = now.iter().map(|r| format!("running {} ({})", r.what, fmt_secs(r.started.elapsed()))).collect();
-                            d.on_hover_text(format!("{s}\n{}", lines.join("\n")))
+                            let lines: Vec<String> =
+                                now.iter().map(|r| tf!("running {what} ({time})", what = r.what, time = fmt_secs(r.started.elapsed()))).collect();
+                            d.on_hover_text(format!("{shown}\n{}", lines.join("\n")))
                         } else {
-                            d.on_hover_text(&s)
+                            d.on_hover_text(&shown)
                         };
                         if d.clicked() {
                             self.retry(ctx, c.name.clone());
                         }
                         let sel = self.form.as_ref().is_some_and(|f| f.orig == c.name);
-                        let kind = if c.kind == Kind::Local { "  (this computer)" } else { "" };
-                        let text = RichText::new(format!("{}{kind}", c.name)).size(14.0);
-                        let tip = format!("{s}\naccess: {}", c.perms.summary());
+                        let text = if c.kind == Kind::Local { format!("{}  ({})", c.name, tr("this computer")) } else { c.name.clone() };
+                        let text = RichText::new(text).size(14.0);
+                        let tip = format!("{shown}\n{}", tf!("access: {perms}", perms = c.perms.summary()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let tg = toggle(ui, c.enabled).on_hover_text(if c.enabled {
-                                "Visible to the agent (click to hide)"
+                                tr("Visible to the agent (click to hide)")
                             } else {
-                                "Hidden from the agent (click to show)"
+                                tr("Hidden from the agent (click to show)")
                             });
                             if tg.clicked() {
                                 self.set_visible(ctx, c.name.clone(), !c.enabled);
@@ -1951,16 +2067,16 @@ impl App {
                     });
                 }
                 if cfg.connections.is_empty() {
-                    ui.label(RichText::new("No connections yet.").weak());
+                    ui.label(RichText::new(tr("No connections yet.")).weak());
                 }
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.form.is_none() {
-                ui.heading("Connections");
+                ui.heading(tr("Connections"));
                 ui.label(
-                    "Select a connection or add one. The agent only sees each connection's name, OS and \
-                     description, never hosts, users or passwords.",
+                    tr("Select a connection or add one. The agent only sees each connection's name, OS and \
+                     description, never hosts, users or passwords."),
                 );
                 ui.add_space(8.0);
                 if let Some(n) = self.guide(ui) {
@@ -1977,7 +2093,7 @@ impl App {
                 Some(f) if f.check => self.problems(f).into_iter().collect(),
                 _ => Default::default(),
             };
-            if errs.is_empty() && self.msg.1 && self.msg.0.starts_with("Can't save yet") {
+            if errs.is_empty() && self.msg.1 && self.msg.0 == self.missing_msg {
                 self.msg = (String::new(), false);
             }
             let scroll_to = self.form.as_mut().and_then(|f| f.scroll_to.take());
@@ -1986,88 +2102,86 @@ impl App {
             let sc = |k: &str| scroll_to == Some(k);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let f = self.form.as_mut().unwrap();
-                ui.heading(if f.orig.is_empty() { "New connection".to_string() } else { format!("Edit '{}'", f.orig) });
+                ui.heading(if f.orig.is_empty() { tr("New connection").to_string() } else { tf!("Edit '{name}'", name = f.orig) });
                 ui.add_space(6.0);
                 egui::Grid::new("form").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                    field_label(ui, "Name", true);
+                    field_label(ui, tr("Name"), true);
                     checked(ui, e("name"), sc("name"), |ui| ui.text_edit_singleline(&mut f.conn.name))
-                        .on_hover_text("What the agent calls this machine, e.g. robot");
+                        .on_hover_text(tr("What the agent calls this machine, e.g. robot"));
                     ui.end_row();
-                    ui.label("Type");
+                    ui.label(tr("Type"));
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut f.conn.kind, Kind::Ssh, "SSH host");
-                        ui.radio_value(&mut f.conn.kind, Kind::Local, "This computer");
+                        ui.radio_value(&mut f.conn.kind, Kind::Ssh, tr("SSH host"));
+                        ui.radio_value(&mut f.conn.kind, Kind::Local, tr("This computer"));
                     });
                     ui.end_row();
                     if f.conn.kind == Kind::Ssh {
-                        field_label(ui, "Host", true);
+                        field_label(ui, tr("Host"), true);
                         checked(ui, e("host"), sc("host"), |ui| ui.text_edit_singleline(&mut f.conn.host))
-                            .on_hover_text("Name or IP address as this computer reaches it, e.g. 192.168.1.20");
+                            .on_hover_text(tr("Name or IP address as this computer reaches it, e.g. 192.168.1.20"));
                         ui.end_row();
-                        field_label(ui, "Port", true);
+                        field_label(ui, tr("Port"), true);
                         let mut port = f.conn.port.to_string();
                         if ui.add(egui::TextEdit::singleline(&mut port).desired_width(70.0)).changed() {
                             f.conn.port = port.trim().parse().unwrap_or(f.conn.port);
                         }
                         ui.end_row();
-                        field_label(ui, "User", true);
+                        field_label(ui, tr("User"), true);
                         checked(ui, e("user"), sc("user"), |ui| ui.text_edit_singleline(&mut f.conn.user));
                         ui.end_row();
-                        ui.label("Login");
+                        ui.label(tr("Login"));
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut f.conn.auth, Auth::Password, "Password");
-                            ui.radio_value(&mut f.conn.auth, Auth::Key, "Private key");
+                            ui.radio_value(&mut f.conn.auth, Auth::Password, tr("Password"));
+                            ui.radio_value(&mut f.conn.auth, Auth::Key, tr("Private key"));
                         });
                         ui.end_row();
                         if f.conn.auth == Auth::Key {
-                            field_label(ui, "Key file", true);
+                            field_label(ui, tr("Key file"), true);
                             checked(ui, e("key"), sc("key"), |ui| ui.text_edit_singleline(&mut f.conn.key_path))
-                                .on_hover_text("e.g. ~/.ssh/id_ed25519");
+                                .on_hover_text(tr("e.g. ~/.ssh/id_ed25519"));
                             ui.end_row();
-                            ui.label("Key passphrase");
+                            ui.label(tr("Key passphrase"));
                             ui.add(
                                 egui::TextEdit::singleline(&mut f.passphrase)
                                     .password(true)
-                                    .hint_text(if f.has_pp { "saved (leave empty to keep)" } else { "none" }),
+                                    .hint_text(if f.has_pp { tr("saved (leave empty to keep)") } else { tr("none") }),
                             );
                             ui.end_row();
                         }
                     }
                     let pw_login = f.conn.kind == Kind::Ssh && f.conn.auth == Auth::Password;
-                    field_label(ui, if pw_login { "Password" } else { "sudo password" }, pw_login);
+                    field_label(ui, if pw_login { tr("Password") } else { tr("sudo password") }, pw_login);
                     ui.horizontal(|ui| {
-                        let hint = if f.has_pw { "saved (leave empty to keep)" } else { "not set" };
+                        let hint = if f.has_pw { tr("saved (leave empty to keep)") } else { tr("not set") };
                         checked(ui, e("password"), sc("password"), |ui| {
                             ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(hint))
                         });
                         if f.has_pw {
-                            ui.checkbox(&mut f.clear_pw, "remove saved");
+                            ui.checkbox(&mut f.clear_pw, tr("remove saved"));
                         }
                     });
                     ui.end_row();
-                    ui.label("Notes for agent").on_hover_text(
-                        "Shown to the agent with the machine list, like a system prompt for this machine",
-                    );
+                    ui.label(tr("Notes for agent")).on_hover_text(tr("Shown to the agent with the machine list, like a system prompt for this machine"));
                     ui.add(
                         egui::TextEdit::multiline(&mut f.conn.description)
                             .desired_rows(5)
                             .desired_width(f32::INFINITY)
                             .hint_text(
-                                "What this machine is and how to work on it, e.g.\n\
+                                tr("What this machine is and how to work on it, e.g.\n\
                                  UR5 arm controller, ROS 2 Humble in ~/ws.\n\
-                                 Never move the arm without asking me first.",
+                                 Never move the arm without asking me first."),
                             ),
                     );
                     ui.end_row();
-                    ui.label("Default directory");
-                    ui.text_edit_singleline(&mut f.conn.cwd).on_hover_text("Where commands start; empty = home");
+                    ui.label(tr("Default directory"));
+                    ui.text_edit_singleline(&mut f.conn.cwd).on_hover_text(tr("Where commands start; empty = home"));
                     ui.end_row();
-                    ui.label("Init commands");
-                    ui.add(egui::TextEdit::multiline(&mut f.conn.init).desired_rows(2).hint_text("e.g. source /opt/ros/humble/setup.bash"));
+                    ui.label(tr("Init commands"));
+                    ui.add(egui::TextEdit::multiline(&mut f.conn.init).desired_rows(2).hint_text(tr("e.g. source /opt/ros/humble/setup.bash")));
                     ui.end_row();
-                    ui.label("Agent access");
-                    ui.checkbox(&mut f.conn.enabled, "Visible to the agent")
-                        .on_hover_text("When off, the agent can't see or use this machine at all");
+                    ui.label(tr("Agent access"));
+                    ui.checkbox(&mut f.conn.enabled, tr("Visible to the agent"))
+                        .on_hover_text(tr("When off, the agent can't see or use this machine at all"));
                     ui.end_row();
                     if f.conn.enabled {
                         ui.label("");
@@ -2081,13 +2195,13 @@ impl App {
                         ui.end_row();
                     }
                     if f.conn.kind == Kind::Ssh {
-                        ui.label("Host key");
+                        ui.label(tr("Host key"));
                         ui.horizontal(|ui| {
                             if f.conn.host_key.is_empty() {
-                                ui.label(RichText::new("not trusted yet (trusted on first connect)").weak());
+                                ui.label(RichText::new(tr("not trusted yet (trusted on first connect)")).weak());
                             } else {
                                 ui.label(RichText::new(&f.conn.host_key).monospace());
-                                if ui.small_button("Forget").clicked() {
+                                if ui.small_button(tr("Forget")).clicked() {
                                     f.conn.host_key.clear();
                                 }
                             }
@@ -2097,24 +2211,24 @@ impl App {
                 });
                 if f.conn.kind == Kind::Ssh {
                     ui.add_space(6.0);
-                    adapter_section(ui, "conn-adapter", &mut f.conn.iface, &adapters, "the SSH connection to this machine");
+                    adapter_section(ui, "conn-adapter", &mut f.conn.iface, &adapters, tr("the SSH connection to this machine"));
                 }
                 ui.add_space(4.0);
-                ui.label(RichText::new("* required").color(RED).size(12.0));
+                ui.label(RichText::new(tr("* required")).color(RED).size(12.0));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!busy, |ui| {
-                        if ui.button(RichText::new("Save").strong()).clicked() {
+                        if ui.button(RichText::new(tr("Save")).strong()).clicked() {
                             action = Some("save");
                         }
-                        if ui.button("Save and test").clicked() {
+                        if ui.button(tr("Save and test")).clicked() {
                             action = Some("test");
                         }
-                        if !f.orig.is_empty() && ui.button(RichText::new("Delete").color(RED)).clicked() {
+                        if !f.orig.is_empty() && ui.button(RichText::new(tr("Delete")).color(RED)).clicked() {
                             action = Some("delete");
                         }
                     });
-                    if ui.button("Close").clicked() {
+                    if ui.button(tr("Close")).clicked() {
                         action = Some("close");
                     }
                 });
@@ -2164,30 +2278,30 @@ impl App {
     fn hub_tab(&mut self, ui: &mut egui::Ui) {
         let errs: std::collections::HashMap<&'static str, String> =
             if self.hub.check { self.hub_problems().into_iter().collect() } else { Default::default() };
-        if errs.is_empty() && self.msg.1 && self.msg.0.starts_with("Can't save yet") {
+        if errs.is_empty() && self.msg.1 && self.msg.0 == self.missing_msg {
             self.msg = (String::new(), false);
         }
         let scroll_to = self.hub.scroll_to.take();
         let e = |k: &str| errs.get(k).map(String::as_str);
         let sc = |k: &str| scroll_to == Some(k);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.heading("Hub");
-            ui.label("The hub runs on the Claude Code server. Get a pairing code there with `ccc-hub token new <name>`.");
+            ui.heading(tr("Hub"));
+            ui.label(tr("The hub runs on the Claude Code server. Get a pairing code there with `ccc-hub token new <name>`."));
             ui.add_space(6.0);
             if let Some(n) = self.guide(ui) {
                 let ctx = ui.ctx().clone();
                 self.nav(&ctx, n);
             }
-            section(ui, "Quick setup");
+            section(ui, tr("Quick setup"));
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.hub.pair)
                         .password(true)
                         .desired_width(460.0)
-                        .hint_text("paste pairing code (ccc1:…)"),
+                        .hint_text(tr("paste pairing code (ccc1:…)")),
                 );
                 let can = !self.busy && !self.hub.pair.trim().is_empty();
-                if ui.add_enabled(can, egui::Button::new(RichText::new("Pair").strong())).clicked() {
+                if ui.add_enabled(can, egui::Button::new(RichText::new(tr("Pair")).strong())).clicked() {
                     let code = self.hub.pair.trim().to_string();
                     let ctx = ui.ctx().clone();
                     self.bg(&ctx, move |rt| {
@@ -2200,25 +2314,25 @@ impl App {
                     });
                 }
             });
-            section(ui, "Manual settings");
+            section(ui, tr("Manual settings"));
             let h = &mut self.hub;
             egui::Grid::new("hub").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                field_label(ui, "Connector name", true);
+                field_label(ui, tr("Connector name"), true);
                 checked(ui, e("hub-name"), sc("hub-name"), |ui| ui.text_edit_singleline(&mut h.name))
-                    .on_hover_text("How the hub and the agent name this connector");
+                    .on_hover_text(tr("How the hub and the agent name this connector"));
                 ui.end_row();
-                field_label(ui, "Hub URL", true);
+                field_label(ui, tr("Hub URL"), true);
                 checked(ui, e("url"), sc("url"), |ui| {
                     ui.add(egui::TextEdit::singleline(&mut h.url).desired_width(400.0).hint_text("wss://your-server.example.com/ccc"))
                 });
                 ui.end_row();
-                field_label(ui, "Token", !h.has_token);
+                field_label(ui, tr("Token"), !h.has_token);
                 checked(ui, e("token"), sc("token"), |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut h.token)
                             .password(true)
                             .desired_width(400.0)
-                            .hint_text(if h.has_token { "saved (leave empty to keep)" } else { "paste token" }),
+                            .hint_text(if h.has_token { tr("saved (leave empty to keep)") } else { tr("paste token") }),
                     )
                 });
                 ui.end_row();
@@ -2226,32 +2340,32 @@ impl App {
             ui.add_space(6.0);
             // proxy, folded unless one is in use (or has a problem)
             let summary = match h.proxy.mode {
-                ProxyMode::Off => "off, direct connection".to_string(),
-                ProxyMode::System => "system settings".to_string(),
-                ProxyMode::Manual if h.proxy.url.trim().is_empty() => "manual".to_string(),
+                ProxyMode::Off => tr("off, direct connection").to_string(),
+                ProxyMode::System => tr("system settings").to_string(),
+                ProxyMode::Manual if h.proxy.url.trim().is_empty() => tr("manual").to_string(),
                 ProxyMode::Manual => h.proxy.url.trim().to_string(),
             };
             let open_now = (e("proxy").is_some() || sc("proxy")).then_some(true);
-            egui::CollapsingHeader::new(RichText::new(format!("Proxy  ({summary})")).strong())
+            egui::CollapsingHeader::new(RichText::new(format!("{}  ({summary})", tr("Proxy"))).strong())
                 .id_salt("proxy")
                 .default_open(h.proxy.mode != ProxyMode::Off)
                 .open(open_now)
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(
-                            "Only the connection to the hub uses the proxy; SSH connections to your machines go \
+                            tr("Only the connection to the hub uses the proxy; SSH connections to your machines go \
                              directly from this computer. The proxy sees the hub's address but not your token or \
-                             traffic (TLS goes end to end).",
+                             traffic (TLS goes end to end)."),
                         )
                         .weak(),
                     );
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Off, "Off");
-                        if ui.radio_value(&mut h.proxy.mode, ProxyMode::System, "Use system proxy").clicked() {
+                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Off, tr("Off"));
+                        if ui.radio_value(&mut h.proxy.mode, ProxyMode::System, tr("Use system proxy")).clicked() {
                             h.sys_proxy = crate::proxy::describe_system();
                         }
-                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Manual, "Manual");
+                        ui.radio_value(&mut h.proxy.mode, ProxyMode::Manual, tr("Manual"));
                     });
                     match h.proxy.mode {
                         ProxyMode::Off => {}
@@ -2261,27 +2375,27 @@ impl App {
                                     h.sys_proxy = crate::proxy::describe_system();
                                 }
                                 ui.label(RichText::new(&h.sys_proxy).monospace());
-                                if ui.small_button("Refresh").clicked() {
+                                if ui.small_button(tr("Refresh")).clicked() {
                                     h.sys_proxy = crate::proxy::describe_system();
                                 }
                             });
                             ui.label(
                                 RichText::new(if cfg!(windows) {
-                                    "From Windows proxy settings (what Clash, v2rayN and browsers use)."
+                                    tr("From Windows proxy settings (what Clash, v2rayN and browsers use).")
                                 } else {
-                                    "From the HTTPS_PROXY / ALL_PROXY environment variables."
+                                    tr("From the HTTPS_PROXY / ALL_PROXY environment variables.")
                                 })
                                 .weak(),
                             );
                         }
                         ProxyMode::Manual => {
                             egui::Grid::new("proxy").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                                field_label(ui, "Proxy address", true);
+                                field_label(ui, tr("Proxy address"), true);
                                 checked(ui, e("proxy"), sc("proxy"), |ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut h.proxy.url)
                                             .desired_width(320.0)
-                                            .hint_text("http://127.0.0.1:7890 or socks5://host:1080"),
+                                            .hint_text(tr("http://127.0.0.1:7890 or socks5://host:1080")),
                                     )
                                 });
                                 ui.end_row();
@@ -2290,20 +2404,20 @@ impl App {
                     }
                     if h.proxy.mode != ProxyMode::Off {
                         egui::Grid::new("proxy-login").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                            field_label(ui, "Proxy user", false);
-                            ui.add(egui::TextEdit::singleline(&mut h.proxy.user).desired_width(200.0).hint_text("only if the proxy needs a login"));
+                            field_label(ui, tr("Proxy user"), false);
+                            ui.add(egui::TextEdit::singleline(&mut h.proxy.user).desired_width(200.0).hint_text(tr("only if the proxy needs a login")));
                             ui.end_row();
                             if !h.proxy.user.trim().is_empty() {
-                                field_label(ui, "Proxy password", false);
+                                field_label(ui, tr("Proxy password"), false);
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut h.proxy_pw)
                                             .password(true)
                                             .desired_width(200.0)
-                                            .hint_text(if h.has_proxy_pw { "saved (leave empty to keep)" } else { "not set" }),
+                                            .hint_text(if h.has_proxy_pw { tr("saved (leave empty to keep)") } else { tr("not set") }),
                                     );
                                     if h.has_proxy_pw {
-                                        ui.checkbox(&mut h.clear_proxy_pw, "remove saved");
+                                        ui.checkbox(&mut h.clear_proxy_pw, tr("remove saved"));
                                     }
                                 });
                                 ui.end_row();
@@ -2312,43 +2426,43 @@ impl App {
                     }
                 });
             let adapters = self.adapters();
-            adapter_section(ui, "hub-adapter", &mut self.hub.iface, &adapters, "the connection to the hub (or to the proxy)");
+            adapter_section(ui, "hub-adapter", &mut self.hub.iface, &adapters, tr("the connection to the hub (or to the proxy)"));
             ui.add_space(4.0);
-            ui.label(RichText::new("* required").color(RED).size(12.0));
+            ui.label(RichText::new(tr("* required")).color(RED).size(12.0));
             ui.add_space(6.0);
             let dirty = self.hub.dirty();
             ui.horizontal(|ui| {
-                let label = RichText::new("Save and connect").strong();
+                let label = RichText::new(tr("Save and connect")).strong();
                 if ui.add_enabled(!self.busy, egui::Button::new(label)).clicked() {
                     let ctx = ui.ctx().clone();
                     self.save_hub(&ctx);
                 }
-                if dirty && ui.button("Undo changes").clicked() {
+                if dirty && ui.button(tr("Undo changes")).clicked() {
                     self.discard(Page::Hub);
                 }
             });
             if self.hub.url.trim().starts_with("ws://") {
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("ws:// is unencrypted: the token and all traffic can be read on the network. Prefer wss://.")
+                    RichText::new(tr("ws:// is unencrypted: the token and all traffic can be read on the network. Prefer wss://."))
                         .color(AMBER),
                 );
             }
             self.msg_line(ui);
-            section(ui, "Status");
-            ui.label(self.rt.hub_status.lock().unwrap().clone());
+            section(ui, tr("Status"));
+            ui.label(i18n::status(&self.rt.hub_status.lock().unwrap()));
             let pin = self.rt.cfg.read().unwrap().hub_cert.clone();
             if !pin.is_empty() {
-                ui.label(RichText::new(format!("pinned certificate {pin}")).monospace().weak());
+                ui.label(RichText::new(tf!("pinned certificate {pin}", pin = pin)).monospace().weak());
             }
             ui.add_space(14.0);
-            egui::CollapsingHeader::new(RichText::new("Clear data").strong()).id_salt("clear").show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new(tr("Clear data")).strong()).id_salt("clear").show(ui, |ui| {
                 ui.label(
-                    "Remove what this connector saved on this computer: connections and their passwords, the hub \
-                     pairing, security settings, statistics. Use it to start over or before handing the computer on.",
+                    tr("Remove what this connector saved on this computer: connections and their passwords, the hub \
+                     pairing, security settings, statistics. Use it to start over or before handing the computer on."),
                 );
                 ui.add_space(4.0);
-                if ui.button(RichText::new("Clear data…").color(RED)).clicked() {
+                if ui.button(RichText::new(tr("Clear data…")).color(RED)).clicked() {
                     self.clear_dlg = Some(ClearDlg {
                         what: store::ClearWhat { connections: true, hub: true, security: true },
                         activity: true,
@@ -2386,7 +2500,7 @@ impl App {
             let ctx = ctx.clone();
             let dir = crate::exec::local::expand(&start);
             self.tokio.spawn_blocking(move || {
-                if let Some(p) = rfd::FileDialog::new().set_title("Choose a folder").set_directory(dir).pick_folder() {
+                if let Some(p) = rfd::FileDialog::new().set_title(tr("Choose a folder")).set_directory(dir).pick_folder() {
                     Self::push(&ev, Event::Picked { row, path: p.to_string_lossy().to_string() });
                     ctx.request_repaint();
                 }
@@ -2439,7 +2553,7 @@ impl App {
         let mut go: Option<String> = None;
         let mut pick: Option<String> = None;
         let mut close = false;
-        egui::Window::new(RichText::new(format!("Choose a folder on {}", b.machine)).strong())
+        egui::Window::new(RichText::new(tf!("Choose a folder on {machine}", machine = b.machine)).strong())
             .collapsible(false)
             .resizable(true)
             .default_size([520.0, 420.0])
@@ -2448,11 +2562,11 @@ impl App {
                 ui.horizontal(|ui| {
                     let up = style.parent(&b.abs);
                     let can_up = up.is_some() || (style.windows && !b.abs.is_empty());
-                    if ui.add_enabled(can_up && !b.loading, egui::Button::new("Up")).clicked() {
+                    if ui.add_enabled(can_up && !b.loading, egui::Button::new(tr("Up"))).clicked() {
                         go = Some(up.unwrap_or_default());
                     }
                     let r = ui.add(egui::TextEdit::singleline(&mut b.path).desired_width(330.0).font(egui::TextStyle::Monospace));
-                    if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button("Go").clicked() {
+                    if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button(tr("Go")).clicked() {
                         go = Some(b.path.clone());
                     }
                     if b.loading {
@@ -2465,7 +2579,7 @@ impl App {
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, false]).show(ui, |ui| {
                     if b.dirs.is_empty() && !b.loading && b.error.is_none() {
-                        ui.label(RichText::new("no sub-folders").weak());
+                        ui.label(RichText::new(tr("no sub-folders")).weak());
                     }
                     for d in &b.dirs {
                         let sep = if style.windows { "\\" } else { "/" };
@@ -2485,10 +2599,10 @@ impl App {
                 ui.horizontal(|ui| {
                     let ok = !b.abs.is_empty() && !b.loading;
                     let shown = style.tilde(&b.abs, &b.home);
-                    if ui.add_enabled(ok, egui::Button::new(RichText::new(format!("Use {shown}")).strong())).clicked() {
+                    if ui.add_enabled(ok, egui::Button::new(RichText::new(tf!("Use {path}", path = shown)).strong())).clicked() {
                         pick = Some(shown);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr("Cancel")).clicked() {
                         close = true;
                     }
                 });
@@ -2551,7 +2665,7 @@ impl App {
             self.confirm_close = false;
             return;
         }
-        egui::Window::new(RichText::new("The agent is still working").strong())
+        egui::Window::new(RichText::new(tr("The agent is still working")).strong())
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
@@ -2566,16 +2680,16 @@ impl App {
                     });
                 }
                 if waiting > 0 {
-                    ui.label(format!("{waiting} request{} waiting for your approval", if waiting == 1 { "" } else { "s" }));
+                    ui.label(if waiting == 1 { tr("1 request waiting for your approval").to_string() } else { tf!("{n} requests waiting for your approval", n = waiting) });
                 }
                 ui.add_space(4.0);
-                ui.label("Closing stops the connector: these tool calls fail and the agent loses access until you open it again. Background jobs keep running.");
+                ui.label(tr("Closing stops the connector: these tool calls fail and the agent loses access until you open it again. Background jobs keep running."));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Keep running").strong()).clicked() {
+                    if ui.button(RichText::new(tr("Keep running")).strong()).clicked() {
                         self.confirm_close = false;
                     }
-                    if ui.button(RichText::new("Close anyway").color(RED)).clicked() {
+                    if ui.button(RichText::new(tr("Close anyway")).color(RED)).clicked() {
                         self.confirm_close = false;
                         self.nav(ctx, Nav::Quit);
                     }
@@ -2588,9 +2702,9 @@ impl App {
         let grants = self.rt.active_grants();
         let sessions = self.rt.sessions();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.heading("Sessions");
+            ui.heading(tr("Sessions"));
             ui.label(
-                RichText::new("Each Claude Code process is one session. What you allow \"for this session\" ends when it exits, or when you revoke it here.")
+                RichText::new(tr("Each Claude Code process is one session. What you allow \"for this session\" ends when it exits, or when you revoke it here."))
                     .weak(),
             );
             ui.add_space(6.0);
@@ -2598,20 +2712,21 @@ impl App {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Allowed for a while").strong().size(15.0));
-                        ui.label(RichText::new("applies to every session").weak());
+                        ui.label(RichText::new(tr("Allowed for a while")).strong().size(15.0));
+                        ui.label(RichText::new(tr("applies to every session")).weak());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Revoke all").clicked() {
+                            if ui.small_button(tr("Revoke all")).clicked() {
                                 self.rt.revoke_grants();
                             }
                         });
                     });
                     for (m, t, sudo, left) in &grants {
                         ui.label(
-                            RichText::new(format!(
-                                "{} on {m}: {} min left",
-                                if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() },
-                                left.as_secs() / 60 + 1
+                            RichText::new(tf!(
+                                "{tool} on {machine}: {n} min left",
+                                tool = if *sudo { tf!("{tool} as root", tool = t.name()) } else { t.name().to_string() },
+                                machine = m,
+                                n = left.as_secs() / 60 + 1
                             ))
                             .color(AMBER),
                         );
@@ -2621,10 +2736,10 @@ impl App {
             }
             if sessions.is_empty() {
                 ui.add_space(20.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("No agent sessions yet. They appear when Claude Code uses one of your machines.").weak()));
+                ui.vertical_centered(|ui| ui.label(RichText::new(tr("No agent sessions yet. They appear when Claude Code uses one of your machines.")).weak()));
             } else if let Some(id) = sessions_card(ui, &sessions) {
                 self.rt.revoke_session(id);
-                self.msg = ("session access revoked".into(), false);
+                self.msg = (tr("session access revoked").into(), false);
             }
         });
     }
@@ -2632,9 +2747,9 @@ impl App {
     fn activity(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Activity");
+                ui.heading(tr("Activity"));
                 if self.demo.is_some() {
-                    ui.label(RichText::new("PREVIEW: generated sample data").color(AMBER).strong());
+                    ui.label(RichText::new(tr("PREVIEW: generated sample data")).color(AMBER).strong());
                 }
             });
             let running = self.rt.running();
@@ -2676,7 +2791,7 @@ impl App {
                         self.rt.save_stats();
                     }
                 }
-                self.msg = ("statistics cleared".into(), false);
+                self.msg = (tr("statistics cleared").into(), false);
             }
         });
     }
@@ -3208,10 +3323,12 @@ mod tests {
     /// Screenshots for the README (docs/screenshots): the real window with a
     /// sample setup.
     /// `CCC_RENDER_DIR=$PWD/docs/screenshots cargo test -p ccc --release render_readme -- --ignored`
+    /// (`CCC_LANG=ja` etc. renders a translation; `CCC_FONT` picks the CJK font)
     #[test]
     #[ignore]
     fn render_readme() {
         use crate::runtime::preview;
+        i18n::set(&std::env::var("CCC_LANG").unwrap_or_else(|_| "en".into()));
         use crate::store::{Access, Kind, Tool};
         let dir = std::env::temp_dir().join(format!("ccc-readme-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

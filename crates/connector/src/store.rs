@@ -451,6 +451,9 @@ pub struct Config {
     /// verify against public CAs.
     pub hub_cert: String,
     pub paused: bool,
+    /// Window language ("" = follow the OS), e.g. "zh-CN".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lang: String,
     /// Network adapter for the hub link (empty = automatic).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub hub_iface: String,
