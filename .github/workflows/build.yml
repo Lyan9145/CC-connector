@@ -1,0 +1,149 @@
+# Test and build every release file on GitHub's runners:
+#
+#   ccc-hub-linux-x86_64     hub          (Ubuntu 22.04, glibc 2.35)
+#   ccc-linux-x86_64         connector    (Ubuntu 22.04, glibc 2.35)
+#   ccc-windows-x86_64.exe   connector    (Windows, MSVC, C runtime linked in)
+#   ccc-macos.zip            connector    (universal: Apple Silicon + Intel, macOS 11+)
+#
+# When it runs:
+# - push to master / pull request: test + build on all three OSes; the files are
+#   kept as "artifacts" on the run's page for 30 days
+# - push a tag like v0.4.4: also attach all files to that GitHub release (a draft
+#   release is created if there isn't one yet)
+# - "Run workflow" button on the Actions tab: optionally give an existing release
+#   tag (e.g. v0.4.3) to (re)upload all files to it
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Also upload to this release (e.g. v0.4.3). Leave empty to only build."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # a newer push to the same branch cancels the older run; tag builds always finish
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one OS failing still shows the others' results
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: windows-x86_64
+            os: windows-2025
+          - name: macos
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # "Run workflow" with a release tag builds that tag's code (the tag must exist)
+          ref: ${{ inputs.release_tag || '' }}
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libxkbcommon-dev libgtk-3-dev
+
+      - name: Rust targets (macOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build settings
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            # no vcruntime140.dll needed on the user's PC
+            Windows) echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV" ;;
+            # oldest macOS the binary runs on (Big Sur, the first with Apple Silicon)
+            macOS)   echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV" ;;
+          esac
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Test
+        shell: bash
+        run: |
+          # the hub is Unix-only (Unix socket between `serve` and `mcp`)
+          if [ "$RUNNER_OS" = Windows ]; then cargo test --workspace --exclude ccc-hub; else cargo test --workspace; fi
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          case "$RUNNER_OS" in
+            Linux)
+              cargo build --release -p ccc-hub -p ccc
+              cp target/release/ccc-hub dist/ccc-hub-linux-x86_64
+              cp target/release/ccc dist/ccc-linux-x86_64
+              ;;
+            Windows)
+              cargo build --release -p ccc
+              cp target/release/ccc.exe dist/ccc-windows-x86_64.exe
+              ;;
+            macOS)
+              cargo build --release -p ccc --target aarch64-apple-darwin
+              cargo build --release -p ccc --target x86_64-apple-darwin
+              lipo -create -output dist/ccc-macos \
+                target/aarch64-apple-darwin/release/ccc \
+                target/x86_64-apple-darwin/release/ccc
+              # ad-hoc signature, required to run on Apple Silicon (not a Developer
+              # ID, so Gatekeeper still asks on first launch)
+              codesign --force --sign - dist/ccc-macos
+              lipo -info dist/ccc-macos
+              # a zip keeps the executable bit (a bare download loses it)
+              (cd dist && zip ccc-macos.zip ccc-macos && rm ccc-macos)
+              ;;
+          esac
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          retention-days: 30
+
+  release:
+    needs: build # only when every OS built and passed its tests
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          ls -la dist
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # draft: add notes and press Publish on GitHub when ready
+            gh release create "$TAG" --draft --title "$TAG" --notes ""
+          fi
+          gh release upload "$TAG" dist/* --clobber
