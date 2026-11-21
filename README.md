@@ -220,13 +220,31 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 - **Top badge:** when it says **OFFLINE**, click it to reconnect to the hub immediately instead of
   waiting for the next automatic retry.
 - **Hub:** pairing and hub status.
-- **Activity:** every request the agent makes, e.g. `14:02:11 robot: exec [sudo] apt-get update`,
-  including refused ones. Temporary "allow for 15 min" grants are listed at the top with a
-  **Revoke** button.
+- **Activity:** analytics of what the agent did, plus the request log (see below). Temporary
+  "allow for 15 min" grants are listed at the top with a **Revoke** button.
 - **Approval needed** pop-up: appears (and flashes the taskbar) when the agent uses a tool set to
   *Ask*. See [Permissions](#permissions).
 - **Pause agent access** (top right): instantly hides all machines from the agent and refuses
   requests, without closing anything.
+
+#### The Activity tab
+
+Pick a period (**last 24 hours / 7 days / 30 days**) and optionally one machine; clicking a
+machine in the *Machines* list does the same.
+
+| Part | Shows |
+|---|---|
+| Summary tiles | **Requests** (agent tool calls; a multi-file push is one), **Success rate** (a command that exits non-zero or times out counts as failed), **Needed you** (approval pop-ups, approved / refused), **Data moved** (up to machines / down to the server), **Typical duration** (median, and the time 95% finish within). Changes are compared with the previous period. |
+| Requests chart | Stacked columns per hour, 6 hours or day: succeeded, failed, refused. Hover a column for its numbers. |
+| Machines | Requests per machine, % of time online, last activity; hover for all-time totals. |
+| Tools | Calls per tool. |
+| Availability | One cell per period and machine, darker or lighter blue by the share of time it was reachable; an outlined cell means the connector wasn't running. |
+| Recent activity | The request log with a filter box: e.g. `14:02:11 robot: exec [sudo] apt-get update`, including refused requests and approvals. |
+
+Statistics are saved in `stats.json` next to the connector config and survive restarts: hourly
+detail for 30 days, all-time totals per machine until you press **Clear statistics** (click twice).
+Availability is sampled once a minute while the connector runs. `ccc preview` opens the window
+with generated sample data, to look at the page before you have history.
 
 ---
 
@@ -488,6 +506,7 @@ short for `--allow sudo` / `--deny sudo`.
 | Saved long outputs | `/tmp/ccc-out/` on the server |
 | Connector settings (no secrets) | Windows `%APPDATA%\ccc\config.toml`, Linux `~/.config/ccc/config.toml` |
 | Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `conn/<name>/password`, `conn/<name>/passphrase`) |
+| Connector statistics | `stats.json` next to the connector config |
 | Background jobs | `~/.ccc/jobs/` on each target machine |
 
 | Variable | Effect |
