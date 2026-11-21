@@ -225,9 +225,13 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 - **Closing the window** while tool calls are running (or waiting for your approval) asks first:
   closing stops the connector, so those calls fail. Background jobs keep running either way.
 - **Hub:** pairing and hub status.
-- **Activity:** what is running right now, agent sessions and what they were granted, analytics
-  of what the agent did, and the request log (see below). Temporary "allow for 15 min" grants are
-  listed at the top with a **Revoke** button.
+- **Activity:** what is running right now, analytics of what the agent did, and the request log
+  (see below).
+- **Sessions:** each Claude Code session that used the connector, with what you allowed it "for
+  this session" (tools and folders). **Revoke** takes that back (the session will ask again); a
+  session's grants also end when the Claude Code session exits. Temporary "allow for 15 min"
+  grants are listed at the top with **Revoke all**. The tab shows a count while anything is
+  granted.
 - **Security:** the [security filters](#security-filters) and recent alerts. The tab turns red
   with a count when something was flagged.
 - **Approval needed** pop-up: appears (and flashes the taskbar) when the agent uses a tool set to
@@ -238,13 +242,9 @@ code. The connector name is how this laptop is labelled on the hub (default: the
 
 #### The Activity tab
 
-At the top, while something is happening:
-
-- **Running now:** each tool call in progress: machine, tool, what it does, how long it has been
-  running, with an animated bar. Finished calls turn green and fade out.
-- **Agent sessions:** each Claude Code session that used the connector, with what you allowed it
-  "for this session" (tools and folders). **Revoke** takes that back (the session will ask again).
-  A session's grants end when the Claude Code session exits.
+At the top, while something is happening, **Running now** lists each tool call in progress:
+machine, tool, what it does, how long it has been running, with an animated bar. Finished calls
+turn green and fade out.
 
 Below that are the analytics. Pick a period (**last 24 hours / 7 days / 30 days**) and optionally
 one machine; clicking a machine in the *Machines* list does the same. Machines in use right now
@@ -366,7 +366,7 @@ approval pop-up asks you. You choose **which folder** to grant (the file's folde
 up to the rule's folder), whether writing is allowed too, and **Allow once** / **Allow for this
 session**. Tick **Remember this folder for all sessions** to save it as a rule. Each Claude Code
 session has its own grants, they end when the session exits, and you can revoke them in
-*Activity → Agent sessions*.
+the *Sessions* tab.
 
 Paths are resolved on the machine before they are checked: `~`, `..` and symbolic links are
 followed, so a link inside an allowed folder that points elsewhere is judged by where it points.

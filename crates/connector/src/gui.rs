@@ -18,6 +18,7 @@ enum Tab {
     Connections,
     Hub,
     Activity,
+    Sessions,
     Security,
 }
 
@@ -1180,9 +1181,13 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             let unseen = self.rt.alerts_unseen.load(std::sync::atomic::Ordering::Relaxed);
-            for (t, name) in [(Tab::Connections, "Connections"), (Tab::Hub, "Hub"), (Tab::Activity, "Activity"), (Tab::Security, "Security")] {
+            // sessions currently holding access, plus timed grants
+            let granted = self.rt.sessions().iter().filter(|s| !s.tools.is_empty() || !s.folders.is_empty()).count() + self.rt.active_grants().len();
+            for (t, name) in [(Tab::Connections, "Connections"), (Tab::Hub, "Hub"), (Tab::Activity, "Activity"), (Tab::Sessions, "Sessions"), (Tab::Security, "Security")] {
                 let label = if t == Tab::Security && unseen > 0 {
                     RichText::new(format!("{name}  ({unseen} new)")).size(14.5).color(RED)
+                } else if t == Tab::Sessions && granted > 0 {
+                    RichText::new(format!("{name}  ({granted})")).size(14.5).color(AMBER)
                 } else {
                     RichText::new(name).size(14.5)
                 };
@@ -1774,8 +1779,52 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
-    fn activity(&mut self, ui: &mut egui::Ui) {
+    fn sessions_tab(&mut self, ui: &mut egui::Ui) {
         let grants = self.rt.active_grants();
+        let sessions = self.rt.sessions();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.heading("Sessions");
+            ui.label(
+                RichText::new("Each Claude Code process is one session. What you allow \"for this session\" ends when it exits, or when you revoke it here.")
+                    .weak(),
+            );
+            ui.add_space(6.0);
+            if !grants.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Allowed for a while").strong().size(15.0));
+                        ui.label(RichText::new("applies to every session").weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Revoke all").clicked() {
+                                self.rt.revoke_grants();
+                            }
+                        });
+                    });
+                    for (m, t, sudo, left) in &grants {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} on {m}: {} min left",
+                                if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() },
+                                left.as_secs() / 60 + 1
+                            ))
+                            .color(AMBER),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            if sessions.is_empty() {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("No agent sessions yet. They appear when Claude Code uses one of your machines.").weak()));
+            } else if let Some(id) = sessions_card(ui, &sessions) {
+                self.rt.revoke_session(id);
+                self.msg = ("session access revoked".into(), false);
+            }
+        });
+    }
+
+    fn activity(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Activity");
@@ -1783,32 +1832,9 @@ impl App {
                     ui.label(RichText::new("PREVIEW: generated sample data").color(AMBER).strong());
                 }
             });
-            if !grants.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Temporarily allowed:").color(AMBER));
-                    for (m, t, sudo, left) in &grants {
-                        ui.label(format!(
-                            "{} on {m} ({} min)",
-                            if *sudo { format!("{} as root", t.name()) } else { t.name().to_string() },
-                            left.as_secs() / 60 + 1
-                        ));
-                    }
-                    if ui.small_button("Revoke").clicked() {
-                        self.rt.revoke_grants();
-                    }
-                });
-            }
             let running = self.rt.running();
             if !running.is_empty() {
                 running_card(ui, &running);
-                ui.add_space(6.0);
-            }
-            let sessions = self.rt.sessions();
-            if !sessions.is_empty() {
-                if let Some(id) = sessions_card(ui, &sessions) {
-                    self.rt.revoke_session(id);
-                    self.msg = ("session access revoked".into(), false);
-                }
                 ui.add_space(6.0);
             }
             ui.add_space(4.0);
@@ -1877,6 +1903,9 @@ impl eframe::App for App {
             }
             Tab::Activity => {
                 egui::CentralPanel::default().show(ctx, |ui| self.activity(ui));
+            }
+            Tab::Sessions => {
+                egui::CentralPanel::default().show(ctx, |ui| self.sessions_tab(ui));
             }
             Tab::Security => {
                 egui::CentralPanel::default().show(ctx, |ui| self.security_tab(ui));
@@ -2093,7 +2122,7 @@ mod tests {
             preview::session("/root/paper (agent, started 09:40)", 12, vec![], &[]),
         ]);
         for (dark, name) in [(true, "activity-min-dark.png"), (false, "activity-min-light.png")] {
-            let (stats, status, log, running, sessions) = (stats.clone(), status.clone(), log.clone(), running.clone(), sessions.clone());
+            let (stats, status, log, running) = (stats.clone(), status.clone(), log.clone(), running.clone());
             let mut st = analytics::PageState::default();
             let mut first = true;
             let size = egui::vec2(MIN_SIZE[0], 1480.0);
@@ -2104,14 +2133,32 @@ mod tests {
                 }
                 ui.heading("Activity");
                 running_card(ui, &running);
-                ui.add_space(6.0);
-                let _ = sessions_card(ui, &sessions);
                 ui.add_space(10.0);
                 let busy: HashSet<String> = ["robot".to_string(), "Fx16_WLS".to_string()].into_iter().collect();
                 let inp = analytics::Inputs { status: &status, log: &log, now: crate::stats::now_secs(), busy: &busy };
                 analytics::page(ui, &mut st, &stats, &inp);
             });
             for _ in 0..8 {
+                h.step();
+            }
+            h.render().unwrap().save(out(name)).unwrap();
+        }
+
+        // Sessions tab
+        for (dark, name) in [(true, "sessions-dark.png"), (false, "sessions-light.png")] {
+            let sessions = sessions.clone();
+            let mut first = true;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(MIN_SIZE[0], 420.0)).wgpu().build_ui(move |ui| {
+                if first {
+                    harness_theme(ui.ctx(), dark);
+                    first = false;
+                }
+                ui.heading("Sessions");
+                ui.label(RichText::new("Each Claude Code process is one session. What you allow \"for this session\" ends when it exits, or when you revoke it here.").weak());
+                ui.add_space(6.0);
+                let _ = sessions_card(ui, &sessions);
+            });
+            for _ in 0..4 {
                 h.step();
             }
             h.render().unwrap().save(out(name)).unwrap();
