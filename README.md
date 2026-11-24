@@ -27,16 +27,20 @@ flowchart TB
         other["Any LAN host"]
     end
 
-    ccc == "WebSocket over TLS<br/>dialled OUT by the laptop" ==> hub
+    hub <==>|"WebSocket over TLS<br/>dialled OUT by the laptop"| ccc
     ccc -- SSH --> wsl
     ccc -- SSH --> robot
     ccc -- SSH --> other
 
-    classDef srv fill:#e8f0fe,stroke:#4a6fd1,color:#1a2b4c
+    classDef claude fill:#d97757,stroke:#a8502f,color:#ffffff
+    classDef srv fill:#f1f3f4,stroke:#80868b,color:#202124
+    classDef conn fill:#1a73e8,stroke:#0b4fa8,color:#ffffff
     classDef lap fill:#e6f4ea,stroke:#3c8c5a,color:#173a24
     classDef tgt fill:#fef7e0,stroke:#c99a16,color:#4a3a08
-    class cc,mcp,hub srv
-    class ccc,local,mcpsrv lap
+    class cc claude
+    class mcp,hub srv
+    class ccc conn
+    class local,mcpsrv lap
     class wsl,robot,other tgt
 ```
 
