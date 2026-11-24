@@ -8,10 +8,10 @@ use crate::filters;
 use crate::i18n::{self, tf, tr};
 use crate::paths;
 use crate::runtime::{self, Answer, Approval, Decision, Running, Runtime, SessionView};
-use crate::store::{self, Access, Auth, Connection, FilterAction, FolderAccess, FolderRule, Kind, Perm, ProxyCfg, ProxyMode};
+use crate::store::{self, Access, Auth, Connection, FilterAction, FolderAccess, FolderRule, Kind, McpTransport, Perm, ProxyCfg, ProxyMode};
 use anyhow::{bail, Result};
 use eframe::egui::{self, Color32, RichText, Stroke};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -39,11 +39,46 @@ struct Form {
     check: bool,
     /// field to scroll to once
     scroll_to: Option<&'static str>,
+    /// one per MCP server in `conn.mcp` (same order)
+    mcp: Vec<McpRow>,
+    /// the MCP servers' variables / headers were read from the keyring
+    mcp_loaded: bool,
+}
+
+/// Form state of one MCP server besides its settings.
+#[derive(Default, Clone)]
+struct McpRow {
+    /// name when the form was opened ("" = new)
+    orig: String,
+    /// environment variables (program) or headers (URL), one per line
+    secret: String,
+    /// `secret` as saved
+    base: String,
+    /// its settings are shown
+    open: bool,
 }
 
 impl Form {
     fn dirty(&self) -> bool {
-        self.conn != self.base || !self.password.is_empty() || !self.passphrase.is_empty() || self.clear_pw
+        self.conn != self.base
+            || !self.password.is_empty()
+            || !self.passphrase.is_empty()
+            || self.clear_pw
+            || self.mcp.iter().any(|r| r.secret != r.base)
+    }
+
+    /// MCP rows matching `base` again (after discarding changes).
+    fn reset_mcp(&mut self) {
+        let old = std::mem::take(&mut self.mcp);
+        self.mcp = self
+            .base
+            .mcp
+            .iter()
+            .map(|m| {
+                let saved = old.iter().find(|r| r.orig == m.name).map(|r| r.base.clone()).unwrap_or_default();
+                McpRow { orig: m.name.clone(), secret: saved.clone(), base: saved, open: false }
+            })
+            .collect();
     }
 }
 
@@ -123,9 +158,12 @@ struct ClearDlg {
 
 enum Event {
     Msg(String, bool),
-    Saved { conn: Connection, then_test: bool },
+    Saved { conn: Box<Connection>, then_test: bool },
     Deleted(String),
-    Secrets { name: String, has_pw: bool, has_pp: bool },
+    /// `mcp`: (server, variables / headers text)
+    Secrets { name: String, has_pw: bool, has_pp: bool, mcp: Vec<(String, String)> },
+    /// "Test" of an MCP server in the form: (server, result)
+    McpTested { name: String, result: String },
     HubSaved,
     Paired { url: String, pinned: bool },
     Test(String),
@@ -210,6 +248,8 @@ struct App {
     adapters: (Option<std::time::Instant>, Vec<crate::netif::Adapter>),
     /// the last "Can't save yet" message (cleared once the fields are fixed)
     missing_msg: String,
+    /// results of MCP server tests in the form, by server name
+    mcp_tests: HashMap<String, String>,
 }
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -300,6 +340,7 @@ impl App {
             guide_hidden: false,
             adapters: (None, vec![]),
             missing_msg: String::new(),
+            mcp_tests: HashMap::new(),
         }
     }
 }
@@ -977,6 +1018,143 @@ fn action_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, a: &mut FilterActio
     });
 }
 
+/// Status color and text of a saved MCP server.
+fn mcp_status(rt: &Runtime, conn: &str, m: &store::McpServer, saved: bool) -> (Color32, String) {
+    if !saved {
+        return (GREY, tr("not saved yet").into());
+    }
+    if !m.enabled {
+        return (GREY, tr("off").into());
+    }
+    match rt.mcp_state(conn, &m.name) {
+        Some(st) if st.status == "running" => (GREEN, tf!("running · {n} tools", n = st.tools.len())),
+        Some(st) if st.status.starts_with("error") => (RED, st.status),
+        _ => (AMBER, tr("starting…").into()),
+    }
+}
+
+/// The MCP servers of a "This computer" connection. Returns the row whose
+/// "Test" was clicked.
+fn mcp_editor(ui: &mut egui::Ui, f: &mut Form, rt: &Runtime, tests: &HashMap<String, String>) -> Option<usize> {
+    let mut test = None;
+    let mut remove = None;
+    let saved_names: Vec<String> = f.base.mcp.iter().map(|m| m.name.clone()).collect();
+    for (i, (m, r)) in f.conn.mcp.iter_mut().zip(f.mcp.iter_mut()).enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width().min(640.0));
+            // saved under this name: the runtime knows it
+            let saved = !r.orig.is_empty() && r.orig == m.name && saved_names.contains(&m.name);
+            let (col, status) = mcp_status(rt, &f.orig, m, saved);
+            ui.horizontal(|ui| {
+                dot(ui, col);
+                ui.label(RichText::new(if m.name.is_empty() { tr("(new server)") } else { &m.name }).strong());
+                let shown: String = m.target().chars().take(40).collect();
+                ui.label(RichText::new(shown).monospace().weak()).on_hover_text(m.target());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(RichText::new(tr("Remove")).color(RED)).clicked() {
+                        remove = Some(i);
+                    }
+                    if ui.small_button(tr("Test")).clicked() {
+                        test = Some(i);
+                    }
+                    if ui.small_button(if r.open { tr("Done") } else { tr("Edit") }).clicked() {
+                        r.open = !r.open;
+                    }
+                    ui.checkbox(&mut m.enabled, tr("On")).on_hover_text(tr("When off, the server isn't started and the agent doesn't see it"));
+                    egui::ComboBox::from_id_salt(("mcp-access", i))
+                        .width(70.0)
+                        .selected_text(RichText::new(access_label(m.access)).color(access_color(m.access)))
+                        .show_ui(ui, |ui| {
+                            for a in [Access::Allow, Access::Ask, Access::Deny] {
+                                ui.selectable_value(&mut m.access, a, RichText::new(access_label(a)).color(access_color(a)));
+                            }
+                        })
+                        .response
+                        .on_hover_text(tr("Allow: the agent calls its tools freely. Ask: you approve each call here. Deny: hidden from the agent."));
+                });
+            });
+            ui.label(RichText::new(&status).color(col).size(12.0));
+            if r.open {
+                egui::Grid::new(("mcp-form", i)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    field_label(ui, tr("Name"), true);
+                    ui.text_edit_singleline(&mut m.name).on_hover_text(tr("What the agent calls this server, e.g. blender"));
+                    ui.end_row();
+                    ui.label(tr("Type"));
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut m.transport, McpTransport::Stdio, tr("Program"));
+                        ui.radio_value(&mut m.transport, McpTransport::Http, tr("URL"));
+                    });
+                    ui.end_row();
+                    match m.transport {
+                        McpTransport::Stdio => {
+                            field_label(ui, tr("Command"), true);
+                            ui.add(egui::TextEdit::singleline(&mut m.command).desired_width(380.0).hint_text("uvx blender-mcp"));
+                            ui.end_row();
+                            ui.label(tr("Folder"));
+                            ui.add(egui::TextEdit::singleline(&mut m.cwd).desired_width(380.0).hint_text(tr("empty = the default directory")));
+                            ui.end_row();
+                            ui.label(tr("Environment"));
+                            ui.add(
+                                egui::TextEdit::multiline(&mut r.secret)
+                                    .desired_rows(2)
+                                    .desired_width(380.0)
+                                    .hint_text(tr("NAME=value, one per line (kept in the keyring)")),
+                            );
+                            ui.end_row();
+                        }
+                        McpTransport::Http => {
+                            field_label(ui, tr("URL"), true);
+                            ui.add(egui::TextEdit::singleline(&mut m.url).desired_width(380.0).hint_text("http://127.0.0.1:8000/mcp"));
+                            ui.end_row();
+                            ui.label(tr("Headers"));
+                            ui.add(
+                                egui::TextEdit::multiline(&mut r.secret)
+                                    .desired_rows(2)
+                                    .desired_width(380.0)
+                                    .hint_text(tr("Name: value, one per line (kept in the keyring)")),
+                            );
+                            ui.end_row();
+                        }
+                    }
+                    ui.label(tr("Timeout"));
+                    ui.horizontal(|ui| {
+                        let mut t = m.timeout.to_string();
+                        if ui.add(egui::TextEdit::singleline(&mut t).desired_width(60.0)).changed() {
+                            m.timeout = t.trim().parse::<u64>().unwrap_or(m.timeout).clamp(1, 3600);
+                        }
+                        ui.label(RichText::new(tr("seconds per tool call, unless the agent asks for another")).weak());
+                    });
+                    ui.end_row();
+                });
+            }
+            if let Some(t) = tests.get(&m.name) {
+                let col = if t.starts_with("FAILED") { RED } else if t.starts_with("ok") { GREEN } else { AMBER };
+                ui.label(RichText::new(t).monospace().color(col).size(12.0));
+            }
+        });
+    }
+    if let Some(i) = remove {
+        f.conn.mcp.remove(i);
+        f.mcp.remove(i);
+    }
+    if ui.button(tr("+ Add MCP server")).clicked() {
+        f.conn.mcp.push(store::McpServer::default());
+        f.mcp.push(McpRow { open: true, ..Default::default() });
+    }
+    if f.conn.mcp.is_empty() {
+        ui.label(RichText::new(tr("e.g. Blender MCP: add a server with the command  uvx blender-mcp")).weak().size(12.0));
+    }
+    test
+}
+
+fn access_label(a: Access) -> &'static str {
+    match a {
+        Access::Allow => tr("Allow"),
+        Access::Ask => tr("Ask"),
+        Access::Deny => tr("Deny"),
+    }
+}
+
 fn access_color(a: Access) -> Color32 {
     match a {
         Access::Allow => GREEN,
@@ -1141,6 +1319,7 @@ fn field_name(k: &str) -> &'static str {
         "url" => tr("Hub URL"),
         "token" => tr("Token"),
         "proxy" => tr("Proxy address"),
+        "mcp" => tr("MCP servers"),
         _ => tr("a field"),
     }
 }
@@ -1201,6 +1380,7 @@ impl App {
                     self.msg = (m, err);
                 }
                 Event::Saved { conn, then_test } => {
+                    let conn = *conn;
                     self.busy = false;
                     let name = conn.name.clone();
                     if let Some(f) = self.form.as_mut() {
@@ -1213,6 +1393,10 @@ impl App {
                         f.passphrase.clear();
                         f.clear_pw = false;
                         f.check = false;
+                        for (r, m) in f.mcp.iter_mut().zip(&f.conn.mcp) {
+                            r.orig = m.name.clone();
+                            r.base = r.secret.clone();
+                        }
                     }
                     self.msg = (tf!("saved '{name}'", name = name), false);
                     if then_test {
@@ -1227,11 +1411,21 @@ impl App {
                     self.form = None;
                     self.msg = (tf!("deleted '{name}'", name = name), false);
                 }
-                Event::Secrets { name, has_pw, has_pp } => {
+                Event::Secrets { name, has_pw, has_pp, mcp } => {
                     if let Some(f) = self.form.as_mut().filter(|f| f.orig == name) {
                         f.has_pw = has_pw;
                         f.has_pp = has_pp;
+                        for (server, text) in mcp {
+                            if let Some(r) = f.mcp.iter_mut().find(|r| r.orig == server) {
+                                r.secret = text.clone();
+                                r.base = text;
+                            }
+                        }
+                        f.mcp_loaded = true;
                     }
+                }
+                Event::McpTested { name, result } => {
+                    self.mcp_tests.insert(name, result);
                 }
                 Event::HubSaved => {
                     self.busy = false;
@@ -1334,8 +1528,11 @@ impl App {
     fn open_form(&mut self, name: Option<&str>) {
         let conn = name.and_then(|n| self.rt.cfg.read().unwrap().get(n).cloned()).unwrap_or_default();
         let orig = name.unwrap_or("").to_string();
-        self.form = Some(Form { base: conn.clone(), conn, orig: orig.clone(), ..Default::default() });
+        let mcp = conn.mcp.iter().map(|m| McpRow { orig: m.name.clone(), ..Default::default() }).collect();
+        let servers: Vec<String> = conn.mcp.iter().map(|m| m.name.clone()).collect();
+        self.form = Some(Form { base: conn.clone(), conn, orig: orig.clone(), mcp, mcp_loaded: orig.is_empty(), ..Default::default() });
         self.test = None;
+        self.mcp_tests.clear();
         self.msg = (String::new(), false);
         if !orig.is_empty() {
             // keyring lookups can be slow (Secret Service), do them off-thread
@@ -1343,7 +1540,14 @@ impl App {
             self.tokio.spawn_blocking(move || {
                 let has_pw = store::get_secret(&store::pw_key(&orig)).ok().flatten().is_some();
                 let has_pp = store::get_secret(&store::pp_key(&orig)).ok().flatten().is_some();
-                Self::push(&ev, Event::Secrets { name: orig, has_pw, has_pp });
+                let mcp = servers
+                    .into_iter()
+                    .map(|s| {
+                        let text = store::get_secret(&store::mcp_key(&orig, &s)).ok().flatten().unwrap_or_default();
+                        (s, text)
+                    })
+                    .collect();
+                Self::push(&ev, Event::Secrets { name: orig, has_pw, has_pp, mcp });
             });
         }
     }
@@ -1375,6 +1579,28 @@ impl App {
                 _ => {}
             }
         }
+        if !c.mcp.is_empty() && c.kind != Kind::Local {
+            v.push(("mcp", tr("MCP servers can only run on \"This computer\"").into()));
+        }
+        for (i, (m, r)) in c.mcp.iter().zip(&f.mcp).enumerate() {
+            let n = m.name.trim();
+            let problem = if store::validate_name(n).is_err() {
+                Some(tr("MCP server names use up to 40 letters, digits, '-', '_' or '.'").to_string())
+            } else if c.mcp[..i].iter().any(|o| o.name.trim() == n) {
+                Some(tf!("two MCP servers are named '{name}'", name = n))
+            } else if m.transport == McpTransport::Stdio && store::split_command(&m.command).is_empty() {
+                Some(tf!("MCP server '{name}' needs a command", name = n))
+            } else if m.transport == McpTransport::Http && !(m.url.trim().starts_with("http://") || m.url.trim().starts_with("https://")) {
+                Some(tf!("MCP server '{name}' needs a URL starting with http:// or https://", name = n))
+            } else if store::parse_pairs(&r.secret, if m.transport == McpTransport::Http { ':' } else { '=' }).is_err() {
+                Some(tf!("MCP server '{name}': write one NAME=value (or Name: value) per line", name = n))
+            } else {
+                None
+            };
+            if let Some(p) = problem {
+                v.push(("mcp", p));
+            }
+        }
         v
     }
 
@@ -1388,6 +1614,12 @@ impl App {
         c.host = c.host.trim().to_string();
         c.user = c.user.trim().to_string();
         c.key_path = c.key_path.trim().to_string();
+        for m in &mut c.mcp {
+            m.name = m.name.trim().to_string();
+            m.command = m.command.trim().to_string();
+            m.url = m.url.trim().to_string();
+            m.cwd = m.cwd.trim().to_string();
+        }
         Ok(c)
     }
 
@@ -1414,6 +1646,10 @@ impl App {
                 return;
             }
         };
+        if !f.mcp_loaded {
+            self.msg = (tr("Still reading the MCP servers' saved variables; try again in a moment.").into(), true);
+            return;
+        }
         if then_test {
             self.test = Some(tr("saving…").into());
         }
@@ -1430,7 +1666,7 @@ impl App {
                     }
                     *slot = c.clone();
                     if c.name != f.orig {
-                        store::rename_secrets(&f.orig, &c.name)?;
+                        store::rename_secrets(&f.orig, &c.name, &c.mcp)?;
                     }
                 }
                 if f.clear_pw {
@@ -1442,14 +1678,68 @@ impl App {
                 if !f.passphrase.is_empty() {
                     store::set_secret(&store::pp_key(&c.name), &f.passphrase)?;
                 }
+                // MCP variables / headers: drop the old entries, write the current ones
+                if !f.orig.is_empty() {
+                    for m in &f.base.mcp {
+                        store::del_secret(&store::mcp_key(&f.orig, &m.name))?;
+                        store::del_secret(&store::mcp_key(&c.name, &m.name))?;
+                    }
+                }
+                for (m, r) in c.mcp.iter().zip(&f.mcp) {
+                    let key = store::mcp_key(&c.name, &m.name);
+                    if r.secret.trim().is_empty() {
+                        store::del_secret(&key)?;
+                    } else {
+                        store::set_secret(&key, r.secret.trim())?;
+                    }
+                }
                 store::save(&cfg)?;
                 let _ = rt.reload();
                 Ok(c)
             })();
             match r {
-                Ok(conn) => Event::Saved { conn, then_test },
+                Ok(conn) => Event::Saved { conn: Box::new(conn), then_test },
                 Err(e) => Event::Msg(format!("{e:#}"), true),
             }
+        });
+    }
+
+    /// Start MCP server `i` of the form as it is (unsaved) and list its tools.
+    fn test_mcp(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(f) = &self.form else { return };
+        let Some((m, r)) = f.conn.mcp.get(i).zip(f.mcp.get(i)) else { return };
+        let mut m = m.clone();
+        m.command = m.command.trim().to_string();
+        m.url = m.url.trim().to_string();
+        let name = m.name.clone();
+        let sep = if m.transport == McpTransport::Http { ':' } else { '=' };
+        let secret = match store::parse_pairs(&r.secret, sep) {
+            Ok(v) => v,
+            Err(e) => {
+                self.mcp_tests.insert(name, format!("FAILED: {e:#}"));
+                return;
+            }
+        };
+        let conn = f.conn.clone();
+        self.mcp_tests.insert(name.clone(), tr("starting…").into());
+        let ev = self.events.clone();
+        let ctx = ctx.clone();
+        self.tokio.spawn(async move {
+            let st = crate::mcp::probe_with(&conn, &m, secret).await;
+            let result = if st.status == "running" {
+                let names: Vec<&str> = st.tools.iter().map(|t| t.name.as_str()).collect();
+                let server = if st.server.is_empty() { String::new() } else { format!("{}, ", st.server) };
+                format!("ok: {server}{} tool(s): {}", names.len(), names.join(", "))
+            } else {
+                let mut s = format!("FAILED: {}", st.status.strip_prefix("error: ").unwrap_or(&st.status));
+                let n = st.stderr.len();
+                for l in st.stderr.iter().skip(n.saturating_sub(8)) {
+                    s.push_str(&format!("\n  | {l}"));
+                }
+                s
+            };
+            Self::push(&ev, Event::McpTested { name, result });
+            ctx.request_repaint();
         });
     }
 
@@ -1583,6 +1873,7 @@ impl App {
                         self.form = None;
                     } else {
                         f.conn = f.base.clone();
+                        f.reset_mcp();
                         f.password.clear();
                         f.passphrase.clear();
                         f.clear_pw = false;
@@ -2087,6 +2378,9 @@ impl App {
             }
             let mut action = None;
             let mut browse_row = 0;
+            let mut mcp_test: Option<usize> = None;
+            let rt = self.rt.clone();
+            let mcp_tests = self.mcp_tests.clone();
             let busy = self.busy;
             // live problems once a save has failed, so fixed fields turn back to normal
             let errs: std::collections::HashMap<&'static str, String> = match &self.form {
@@ -2194,6 +2488,19 @@ impl App {
                         }
                         ui.end_row();
                     }
+                    if f.conn.kind == Kind::Local || !f.conn.mcp.is_empty() {
+                        let tip = tr("Programs on this computer whose tools the agent can use (through its `mcp` tool), e.g. uvx blender-mcp");
+                        field_label(ui, tr("MCP servers"), false).on_hover_text(tip);
+                        checked(ui, e("mcp"), sc("mcp"), |ui| {
+                            ui.vertical(|ui| {
+                                if let Some(i) = mcp_editor(ui, f, &rt, &mcp_tests) {
+                                    mcp_test = Some(i);
+                                }
+                            })
+                            .response
+                        });
+                        ui.end_row();
+                    }
                     if f.conn.kind == Kind::Ssh {
                         ui.label(tr("Host key"));
                         ui.horizontal(|ui| {
@@ -2249,8 +2556,10 @@ impl App {
                     self.bg(ctx, move |rt| {
                         let r = (|| -> Result<()> {
                             let mut c = store::load()?;
+                            if let Some(gone) = c.get(&name).cloned() {
+                                store::delete_conn_secrets(&gone)?;
+                            }
                             c.connections.retain(|x| x.name != name);
-                            store::delete_conn_secrets(&name)?;
                             store::save(&c)
                         })();
                         let _ = rt.reload();
@@ -2263,6 +2572,9 @@ impl App {
                 Some("close") => self.nav(ctx, Nav::CloseForm),
                 Some("browse") => self.browse(ctx, browse_row),
                 _ => {}
+            }
+            if let Some(i) = mcp_test {
+                self.test_mcp(ctx, i);
             }
             self.msg_line(ui);
         });
@@ -2983,6 +3295,73 @@ mod tests {
     /// Renders the new 0.4 screens: approval dialogs, running / sessions
     /// cards with the Activity page at the minimum window width, Security tab
     /// and folder rules.
+    #[test]
+    #[ignore]
+    fn render_mcp() {
+        use crate::runtime::preview;
+        use crate::store::Tool;
+        std::env::set_var("CCC_DIR", std::env::temp_dir().join(format!("ccc-render-cfg-{}", std::process::id())));
+        std::env::set_var("CCC_SECRETS", "file");
+        let rt = Runtime::new(false);
+        let blender = store::McpServer { name: "blender".into(), command: "uvx blender-mcp".into(), ..Default::default() };
+        let web = store::McpServer {
+            name: "docs".into(),
+            transport: McpTransport::Http,
+            url: "http://127.0.0.1:8000/mcp".into(),
+            access: Access::Allow,
+            ..Default::default()
+        };
+        let conn = Connection { name: "laptop".into(), kind: Kind::Local, mcp: vec![blender, web], ..Default::default() };
+        let rows = vec![
+            McpRow { orig: "blender".into(), secret: "BLENDER_HOST=127.0.0.1".into(), base: String::new(), open: true },
+            McpRow { orig: "docs".into(), ..Default::default() },
+        ];
+        let tests: HashMap<String, String> = [(
+            "blender".to_string(),
+            "ok: BlenderMCP 1.26.0, 17 tool(s): get_scene_info, get_object_info, get_viewport_screenshot, execute_blender_code, …".to_string(),
+        )]
+        .into();
+        for dark in [true, false] {
+            let mut f = Form { base: conn.clone(), conn: conn.clone(), orig: "laptop".into(), mcp: rows.clone(), mcp_loaded: true, ..Default::default() };
+            let rt = rt.clone();
+            let tests = tests.clone();
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(820.0, 560.0)).wgpu().build(move |ctx| {
+                harness_theme(ctx, dark);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::Grid::new("form").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
+                        field_label(ui, tr("MCP servers"), false);
+                        ui.vertical(|ui| {
+                            let _ = mcp_editor(ui, &mut f, &rt, &tests);
+                        });
+                        ui.end_row();
+                    });
+                });
+            });
+            for _ in 0..6 {
+                h.step();
+            }
+            h.render().unwrap().save(out(if dark { "mcp-form.png" } else { "mcp-form-light.png" })).unwrap();
+        }
+        let a = Rc::new(preview::approval(
+            "laptop",
+            Tool::Mcp,
+            "MCP server \"blender\", tool \"execute_blender_code\"\n\n{\n  \"code\": \"import bpy\\nbpy.ops.mesh.primitive_monkey_add(location=(0, 0, 1))\"\n}",
+            true,
+            vec![],
+            None,
+        ));
+        let mut ch = ApprovalChoice::default();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(760.0, 520.0)).wgpu().build(move |ctx| {
+            harness_theme(ctx, true);
+            egui::CentralPanel::default().show(ctx, |_| {});
+            let _ = approval_window(ctx, &a, 0, &mut ch);
+        });
+        for _ in 0..6 {
+            h.step();
+        }
+        h.render().unwrap().save(out("approval-mcp.png")).unwrap();
+    }
+
     #[test]
     #[ignore]
     fn render_preview_v4() {

@@ -5,7 +5,7 @@ use crate::config::{self, HubConfig, Token};
 use crate::tokens;
 use crate::users::{self, Caller};
 use anyhow::{Context, Result};
-use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, Op, OpResult, Session, TokenReq, TokenResp, Tool, Up};
+use ccc_proto::{self as proto, Down, IpcReq, IpcResp, Listed, MachineInfo, McpOp, Op, OpResult, Session, TokenReq, TokenResp, Tool, Up};
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -126,6 +126,8 @@ impl Hub {
         // leave room for the owner to approve "ask" requests (up to 2 min)
         let timeout = match &op {
             Op::Exec { timeout, .. } => Duration::from_secs(timeout + 180),
+            // 0 = the server's own default, which the hub doesn't know (at most 3600)
+            Op::Mcp(McpOp::Call { timeout, .. }) => Duration::from_secs(if *timeout == 0 { 3600 } else { *timeout } + 180),
             _ => Duration::from_secs(600),
         };
         let id = self.id();
@@ -493,6 +495,7 @@ mod tests {
             ask: vec![],
             denied: vec![],
             folders: String::new(),
+            mcp: vec![],
         }
     }
 

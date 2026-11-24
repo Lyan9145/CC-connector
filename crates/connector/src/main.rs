@@ -6,6 +6,7 @@ mod filters;
 mod gui;
 #[cfg(feature = "gui")]
 mod i18n;
+mod mcp;
 mod ops;
 mod paths;
 mod netif;
@@ -102,9 +103,66 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<SecCmd>,
     },
+    /// MCP servers on this computer, for the agent's `mcp` tool.
+    Mcp {
+        #[command(subcommand)]
+        cmd: Option<McpCmd>,
+    },
     /// Open the GUI with generated statistics on the Activity tab (design preview).
     #[command(hide = true)]
     Preview,
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// List the MCP servers (of one connection, or all).
+    List { machine: Option<String> },
+    /// Add or replace an MCP server on a "This computer" connection, e.g.
+    /// `ccc mcp add laptop blender -- uvx blender-mcp` or
+    /// `ccc mcp add laptop web --url http://127.0.0.1:8000/mcp`.
+    Add {
+        machine: String,
+        name: String,
+        /// Connect to a server listening on this URL instead of starting a program.
+        #[arg(long)]
+        url: Option<String>,
+        /// Environment variable for the program (repeatable); kept in the keyring.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// HTTP header for --url servers (repeatable); kept in the keyring.
+        #[arg(long = "header", value_name = "NAME: VALUE")]
+        header: Vec<String>,
+        /// allow, ask (each call needs your approval) or deny.
+        #[arg(long, default_value = "ask")]
+        access: String,
+        /// Folder the program starts in (default: the connection's, else home).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Default seconds a tool call may take (1-3600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// The program and its arguments, after `--`.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Change an MCP server's access or timeout, or turn it on or off.
+    Set {
+        machine: String,
+        name: String,
+        /// allow, ask or deny.
+        #[arg(long)]
+        access: Option<String>,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Remove an MCP server (and its saved variables / headers).
+    Rm { machine: String, name: String },
+    /// Start an MCP server once and list its tools.
+    Test { machine: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -483,6 +541,7 @@ fn main() -> Result<()> {
             let conn = c.get_mut(&name).with_context(|| format!("no connection '{name}'"))?;
             let old_endpoint = (conn.host.clone(), conn.port);
             apply(conn, &o)?;
+            conn.validate_mcp()?;
             if (conn.host.clone(), conn.port) != old_endpoint {
                 conn.host_key.clear();
             }
@@ -496,7 +555,8 @@ fn main() -> Result<()> {
                 if c.connections.iter().filter(|x| x.name == final_name).count() > 1 {
                     bail!("connection '{final_name}' exists");
                 }
-                store::rename_secrets(&name, &final_name)?;
+                let mcp = c.get(&final_name).map(|x| x.mcp.clone()).unwrap_or_default();
+                store::rename_secrets(&name, &final_name, &mcp)?;
             }
             save_secrets(&final_name, &o)?;
             store::save(&c)?;
@@ -505,12 +565,9 @@ fn main() -> Result<()> {
         }
         Cmd::Rm { name } => {
             let mut c = store::load()?;
-            let n = c.connections.len();
+            let gone = c.get(&name).cloned().with_context(|| format!("no connection '{name}'"))?;
             c.connections.retain(|x| x.name != name);
-            if n == c.connections.len() {
-                bail!("no connection '{name}'");
-            }
-            store::delete_conn_secrets(&name)?;
+            store::delete_conn_secrets(&gone)?;
             store::save(&c)?;
             println!("removed '{name}'");
             Ok(())
@@ -577,6 +634,12 @@ fn main() -> Result<()> {
             } else {
                 println!("folders:  no limits");
             }
+            if !x.mcp.is_empty() {
+                println!("MCP servers:");
+                for m in &x.mcp {
+                    println!("  {}", mcp_line(m));
+                }
+            }
             println!("notes for the agent:");
             if x.description.is_empty() {
                 println!("  (none)");
@@ -608,6 +671,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Security { cmd } => security_cmd(cmd.unwrap_or(SecCmd::List)),
+        Cmd::Mcp { cmd } => mcp_cmd(cmd.unwrap_or(McpCmd::List { machine: None })),
         Cmd::Adapters => {
             let all = netif::list();
             if all.is_empty() {
@@ -717,6 +781,140 @@ fn security_cmd(cmd: SecCmd) -> Result<()> {
             }
             for h in hits {
                 println!("{:6} {}  (matched `{}`)", h.action.key(), h.name, h.matched);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// One line about an MCP server for `ccc mcp list` / `ccc show`.
+fn mcp_line(m: &store::McpServer) -> String {
+    format!(
+        "{:14} {:5} {}{}  ({}, timeout {}s)",
+        m.name,
+        m.access.key(),
+        m.target(),
+        if m.enabled { "" } else { "  [off]" },
+        match m.transport {
+            store::McpTransport::Stdio => "program",
+            store::McpTransport::Http => "url",
+        },
+        m.timeout
+    )
+}
+
+/// Join command-line words back into one line our splitter reads the same.
+fn join_command(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| if w.is_empty() || w.contains(char::is_whitespace) || w.contains('\'') { format!("\"{w}\"") } else if w.contains('"') { format!("'{w}'") } else { w.clone() })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_access(s: &str) -> Result<Access> {
+    Access::parse(s).with_context(|| format!("unknown access '{s}' (allow, ask or deny)"))
+}
+
+fn mcp_cmd(cmd: McpCmd) -> Result<()> {
+    let mut c = store::load()?;
+    match cmd {
+        McpCmd::List { machine } => {
+            let mut any = false;
+            for x in c.connections.iter().filter(|x| machine.as_ref().is_none_or(|m| *m == x.name)) {
+                for m in &x.mcp {
+                    any = true;
+                    println!("{:12} {}", x.name, mcp_line(m));
+                }
+            }
+            if !any {
+                println!("no MCP servers. Add one with e.g. `ccc mcp add <this computer's connection> blender -- uvx blender-mcp`");
+            }
+            Ok(())
+        }
+        McpCmd::Add { machine, name, url, env, header, access, cwd, timeout, command } => {
+            let conn = c.get_mut(&machine).with_context(|| format!("no connection '{machine}'"))?;
+            let m = store::McpServer {
+                name: name.clone(),
+                transport: if url.is_some() { store::McpTransport::Http } else { store::McpTransport::Stdio },
+                command: join_command(&command),
+                url: url.clone().unwrap_or_default(),
+                cwd: cwd.unwrap_or_default(),
+                access: parse_access(&access)?,
+                timeout,
+                ..Default::default()
+            };
+            if url.is_some() && !command.is_empty() {
+                bail!("give either --url or a command after `--`, not both");
+            }
+            if url.is_none() && !header.is_empty() {
+                bail!("--header is for --url servers; programs get --env");
+            }
+            if url.is_some() && !env.is_empty() {
+                bail!("--env is for programs; --url servers get --header");
+            }
+            let (lines, sep) = if url.is_some() { (&header, ':') } else { (&env, '=') };
+            let secret = lines.join("\n");
+            store::parse_pairs(&secret, sep)?;
+            let replaced = conn.mcp.iter().any(|x| x.name == name);
+            conn.mcp.retain(|x| x.name != name);
+            conn.mcp.push(m);
+            conn.validate_mcp()?;
+            let key = store::mcp_key(&machine, &name);
+            if secret.is_empty() {
+                store::del_secret(&key)?;
+            } else {
+                store::set_secret(&key, &secret)?;
+            }
+            store::save(&c)?;
+            println!("{} MCP server '{name}' on '{machine}'. Try `ccc mcp test {machine} {name}`", if replaced { "replaced" } else { "added" });
+            Ok(())
+        }
+        McpCmd::Set { machine, name, access, timeout, enable, disable } => {
+            let conn = c.get_mut(&machine).with_context(|| format!("no connection '{machine}'"))?;
+            let m = conn.mcp.iter_mut().find(|x| x.name == name).with_context(|| format!("no MCP server '{name}' on '{machine}'"))?;
+            if let Some(a) = access {
+                m.access = parse_access(&a)?;
+            }
+            if let Some(t) = timeout {
+                m.timeout = t;
+            }
+            if enable || disable {
+                m.enabled = enable;
+            }
+            let line = mcp_line(m);
+            conn.validate_mcp()?;
+            store::save(&c)?;
+            println!("{machine}: {line}");
+            Ok(())
+        }
+        McpCmd::Rm { machine, name } => {
+            let conn = c.get_mut(&machine).with_context(|| format!("no connection '{machine}'"))?;
+            let n = conn.mcp.len();
+            conn.mcp.retain(|x| x.name != name);
+            if n == conn.mcp.len() {
+                bail!("no MCP server '{name}' on '{machine}'");
+            }
+            store::del_secret(&store::mcp_key(&machine, &name))?;
+            store::save(&c)?;
+            println!("removed MCP server '{name}' from '{machine}'");
+            Ok(())
+        }
+        McpCmd::Test { machine, name } => {
+            let conn = c.get(&machine).with_context(|| format!("no connection '{machine}'"))?;
+            let m = conn.mcp_server(&name).with_context(|| format!("no MCP server '{name}' on '{machine}'"))?;
+            println!("starting {} …", m.target());
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let st = tokio::runtime::Runtime::new()?.block_on(mcp::probe(conn, m))?;
+            if st.status != "running" {
+                for l in &st.stderr {
+                    eprintln!("  | {l}");
+                }
+                bail!("{}", st.status.strip_prefix("error: ").unwrap_or(&st.status));
+            }
+            println!("ok: {}{} tool{}", if st.server.is_empty() { String::new() } else { format!("{}, ", st.server) }, st.tools.len(), if st.tools.len() == 1 { "" } else { "s" });
+            for t in &st.tools {
+                println!("  {:24} {}", t.name, t.description.lines().next().unwrap_or(""));
             }
             Ok(())
         }

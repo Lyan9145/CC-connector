@@ -136,6 +136,8 @@ async fn run_op(ctx: &Ctx<'_>, op: Op) -> Result<OpOk> {
             Ok(OpOk::Done { n: 0 })
         }
         Op::Job(j) => Ok(OpOk::Text(job(ctx, j).await?)),
+        // MCP servers belong to the runtime (see `Runtime::mcp_op`)
+        Op::Mcp(_) => bail!("MCP requests are not handled here"),
     }
 }
 

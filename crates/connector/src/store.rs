@@ -32,6 +32,22 @@ pub enum Access {
     Deny,
 }
 
+impl Access {
+    pub const ALL: [Access; 3] = [Access::Allow, Access::Ask, Access::Deny];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Access::Allow => "allow",
+            Access::Ask => "ask",
+            Access::Deny => "deny",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Access> {
+        Access::ALL.into_iter().find(|a| a.key() == s)
+    }
+}
+
 /// Per-connection permissions: one level per tool plus one for sudo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -87,6 +103,7 @@ impl Perm {
             Perm::Tool(Tool::Push) => "Upload from server",
             Perm::Tool(Tool::Pull) => "Download to server",
             Perm::Tool(Tool::Job) => "Background jobs",
+            Perm::Tool(Tool::Mcp) => "MCP tools",
             Perm::Sudo => "Run as root (sudo)",
         }
     }
@@ -110,16 +127,20 @@ impl Perms {
         Perms { read: Access::Allow, pull: Access::Allow, ..Perms::uniform(rest) }
     }
 
+    /// `mcp` has no level of its own here (each MCP server has its own
+    /// access, see [`McpServer::access`]); it reads as Allow.
     pub fn get(&self, p: Perm) -> Access {
-        *self.slot(p)
+        self.slot(p).copied().unwrap_or(Access::Allow)
     }
 
     pub fn set(&mut self, p: Perm, a: Access) {
-        *self.slot_mut(p) = a;
+        if let Some(s) = self.slot_mut(p) {
+            *s = a;
+        }
     }
 
-    fn slot(&self, p: Perm) -> &Access {
-        match p {
+    fn slot(&self, p: Perm) -> Option<&Access> {
+        Some(match p {
             Perm::Tool(Tool::Exec) => &self.exec,
             Perm::Tool(Tool::Read) => &self.read,
             Perm::Tool(Tool::Write) => &self.write,
@@ -128,11 +149,12 @@ impl Perms {
             Perm::Tool(Tool::Pull) => &self.pull,
             Perm::Tool(Tool::Job) => &self.job,
             Perm::Sudo => &self.sudo,
-        }
+            Perm::Tool(Tool::Mcp) => return None,
+        })
     }
 
-    fn slot_mut(&mut self, p: Perm) -> &mut Access {
-        match p {
+    fn slot_mut(&mut self, p: Perm) -> Option<&mut Access> {
+        Some(match p {
             Perm::Tool(Tool::Exec) => &mut self.exec,
             Perm::Tool(Tool::Read) => &mut self.read,
             Perm::Tool(Tool::Write) => &mut self.write,
@@ -141,7 +163,8 @@ impl Perms {
             Perm::Tool(Tool::Pull) => &mut self.pull,
             Perm::Tool(Tool::Job) => &mut self.job,
             Perm::Sudo => &mut self.sudo,
-        }
+            Perm::Tool(Tool::Mcp) => return None,
+        })
     }
 
     /// Key of the matching preset, if any.
@@ -243,6 +266,133 @@ pub struct FolderRule {
     pub access: FolderAccess,
 }
 
+/// How the connector talks to an MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Start a program and talk over its stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect to a server already listening on a URL (Streamable HTTP).
+    Http,
+}
+
+/// An MCP server the connector runs (or connects to) on the machine itself,
+/// for the agent's `mcp` tool. Environment variables and HTTP headers can
+/// hold API keys, so they are kept in the keyring ([`mcp_key`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServer {
+    pub name: String,
+    pub enabled: bool,
+    pub transport: McpTransport,
+    /// stdio: the command line, e.g. `uvx blender-mcp`
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    /// stdio: working folder (empty = the connection's, else home)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    /// http: e.g. http://127.0.0.1:8000/mcp
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Whether the agent may call its tools: allow, ask each time, or deny.
+    pub access: Access,
+    /// Default seconds a tool call may take.
+    pub timeout: u64,
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            transport: McpTransport::Stdio,
+            command: String::new(),
+            cwd: String::new(),
+            url: String::new(),
+            access: Access::Ask,
+            timeout: 300,
+        }
+    }
+}
+
+impl McpServer {
+    /// What it runs or connects to, for lists.
+    pub fn target(&self) -> &str {
+        match self.transport {
+            McpTransport::Stdio => &self.command,
+            McpTransport::Http => &self.url,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_name(&self.name).context("MCP server name")?;
+        match self.transport {
+            McpTransport::Stdio if split_command(&self.command).is_empty() => bail!("MCP server '{}': the command is empty", self.name),
+            McpTransport::Http if !(self.url.starts_with("http://") || self.url.starts_with("https://")) => {
+                bail!("MCP server '{}': the URL must start with http:// or https://", self.name)
+            }
+            _ => {}
+        }
+        if self.timeout == 0 || self.timeout > 3600 {
+            bail!("MCP server '{}': timeout must be 1-3600 seconds", self.name);
+        }
+        Ok(())
+    }
+}
+
+/// Split a command line into program and arguments. Double or single
+/// quotes group words; backslashes are kept as they are (Windows paths).
+pub fn split_command(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut have = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                have = true;
+            }
+            None if c.is_whitespace() => {
+                if have {
+                    out.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                have = true;
+            }
+        }
+    }
+    if have {
+        out.push(cur);
+    }
+    out
+}
+
+/// `KEY=VALUE` lines (environment) or `Name: value` lines (HTTP headers);
+/// blank lines and lines starting with '#' are skipped.
+pub fn parse_pairs(text: &str, sep: char) -> Result<Vec<(String, String)>> {
+    let mut v = vec![];
+    for (i, line) in text.lines().enumerate() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let Some((k, val)) = l.split_once(sep) else { bail!("line {}: expected NAME{sep}value", i + 1) };
+        let k = k.trim();
+        if k.is_empty() || k.contains(char::is_whitespace) {
+            bail!("line {}: bad name '{k}'", i + 1);
+        }
+        v.push((k.to_string(), val.trim().to_string()));
+    }
+    Ok(v)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Connection {
@@ -274,6 +424,9 @@ pub struct Connection {
     /// automatic, i.e. the system's routing).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub iface: String,
+    /// MCP servers on this machine ("This computer" connections only).
+    #[serde(rename = "mcp", skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpServer>,
     /// Pre-0.3 config; migrated into `perms.sudo` on load.
     #[serde(skip_serializing)]
     pub allow_sudo: Option<bool>,
@@ -298,6 +451,7 @@ impl Default for Connection {
             folders: vec![],
             elsewhere: FolderAccess::Full,
             iface: String::new(),
+            mcp: vec![],
             allow_sudo: None,
         }
     }
@@ -314,6 +468,24 @@ impl Connection {
             && self.auth == o.auth
             && self.key_path == o.key_path
             && self.host_key == o.host_key
+    }
+
+    pub fn mcp_server(&self, name: &str) -> Option<&McpServer> {
+        self.mcp.iter().find(|m| m.name == name)
+    }
+
+    /// Check the MCP server list (unique valid names, local machines only).
+    pub fn validate_mcp(&self) -> Result<()> {
+        if !self.mcp.is_empty() && self.kind != Kind::Local {
+            bail!("MCP servers can only be added to a \"This computer\" connection");
+        }
+        for (i, m) in self.mcp.iter().enumerate() {
+            m.validate()?;
+            if self.mcp[..i].iter().any(|o| o.name == m.name) {
+                bail!("two MCP servers are named '{}'", m.name);
+            }
+        }
+        Ok(())
     }
 
     /// Whether folder rules limit the file tools at all.
@@ -617,12 +789,21 @@ pub struct Secrets {
     pub passphrase: Option<String>,
 }
 
+/// Keyring entry holding an MCP server's environment variables (stdio) or
+/// HTTP headers, as text lines.
+pub fn mcp_key(conn: &str, server: &str) -> String {
+    format!("conn/{conn}/mcp/{server}")
+}
+
 pub fn conn_secrets(name: &str) -> Result<Secrets> {
     Ok(Secrets { password: get_secret(&pw_key(name))?, passphrase: get_secret(&pp_key(name))? })
 }
 
-pub fn rename_secrets(old: &str, new: &str) -> Result<()> {
-    for (o, n) in [(pw_key(old), pw_key(new)), (pp_key(old), pp_key(new))] {
+/// Move a connection's secrets to its new name (`mcp`: its MCP server names).
+pub fn rename_secrets(old: &str, new: &str, mcp: &[McpServer]) -> Result<()> {
+    let mut pairs = vec![(pw_key(old), pw_key(new)), (pp_key(old), pp_key(new))];
+    pairs.extend(mcp.iter().map(|m| (mcp_key(old, &m.name), mcp_key(new, &m.name))));
+    for (o, n) in pairs {
         if let Some(v) = get_secret(&o)? {
             set_secret(&n, &v)?;
             del_secret(&o)?;
@@ -631,9 +812,12 @@ pub fn rename_secrets(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_conn_secrets(name: &str) -> Result<()> {
-    del_secret(&pw_key(name))?;
-    del_secret(&pp_key(name))
+pub fn delete_conn_secrets(c: &Connection) -> Result<()> {
+    for m in &c.mcp {
+        del_secret(&mcp_key(&c.name, &m.name))?;
+    }
+    del_secret(&pw_key(&c.name))?;
+    del_secret(&pp_key(&c.name))
 }
 
 /// What "Clear data" removes.
@@ -653,7 +837,7 @@ pub fn clear_data(w: ClearWhat) -> Result<()> {
     let mut c = load()?;
     if w.connections {
         for x in &c.connections {
-            delete_conn_secrets(&x.name)?;
+            delete_conn_secrets(x)?;
         }
         c.connections.clear();
     }
@@ -726,5 +910,31 @@ mod tests {
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.connections[0].perms.preset(), Some("ask"));
         assert_eq!(back.connections[0].description, "line one\nline two");
+    }
+
+    #[test]
+    fn mcp_servers() {
+        assert_eq!(split_command(r#"uvx blender-mcp"#), ["uvx", "blender-mcp"]);
+        assert_eq!(split_command(r#" "C:\Program Files\x.exe"  --a 'b c' "" "#), [r"C:\Program Files\x.exe", "--a", "b c", ""]);
+        assert!(split_command("   ").is_empty());
+        assert_eq!(parse_pairs("A=1\n# c\n\n B = x=y \n", '=').unwrap(), [("A".into(), "1".into()), ("B".into(), "x=y".into())]);
+        assert!(parse_pairs("nope", '=').is_err());
+        assert_eq!(parse_pairs("Authorization: Bearer x", ':').unwrap(), [("Authorization".into(), "Bearer x".into())]);
+
+        let t = "name = \"x\"\n[[connection]]\nname = \"laptop\"\nkind = \"local\"\n\
+                 [[connection.mcp]]\nname = \"blender\"\ncommand = \"uvx blender-mcp\"\n";
+        let c: Config = toml::from_str(t).unwrap();
+        let m = &c.connections[0].mcp[0];
+        assert_eq!((m.access, m.timeout, m.enabled, m.transport), (Access::Ask, 300, true, McpTransport::Stdio));
+        c.connections[0].validate_mcp().unwrap();
+        let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.connections[0].mcp, c.connections[0].mcp);
+        let mut ssh = c.connections[0].clone();
+        ssh.kind = Kind::Ssh;
+        assert!(ssh.validate_mcp().is_err());
+        let mut dup = c.connections[0].clone();
+        dup.mcp.push(dup.mcp[0].clone());
+        assert!(dup.validate_mcp().is_err());
+        assert_eq!(Perms::default().get(Perm::Tool(Tool::Mcp)), Access::Allow);
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::format;
 use anyhow::{anyhow, bail, Context, Result};
-use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, Op, OpOk, Session, Tool, CHUNK};
+use ccc_proto::{self as proto, Entry, IpcReq, IpcResp, JobOp, Listed, McpOp, Op, OpOk, Session, Tool, CHUNK};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,10 @@ Text indented under a machine in `machines` is its owner's notes: follow them wh
 `ask:` tools wait for the owner to approve each use (may take a minute or be refused); \
 `denied:` tools are unavailable there, so don't try them or work around them. \
 `folders:` limits where the file tools (read/write/edit/push/pull) may go; folders marked \
-`ask once` prompt the owner the first time this session touches them. `read` also shows images.";
+`ask once` prompt the owner the first time this session touches them. `read` also shows images. \
+`mcp:` under a machine lists MCP servers its owner runs there (e.g. Blender); use the `mcp` tool \
+to list their tools (action=list) and call them (action=call). The servers and their tools can \
+change at any time: if one you expect is missing, run `machines` or `mcp` list again.";
 
 fn tools() -> Value {
     let m = json!({"type":"string","description":"machine name from `machines`"});
@@ -54,7 +57,14 @@ fn tools() -> Value {
          "inputSchema":{"type":"object","required":["machine","action"],"properties":{
             "machine":m,"action":{"type":"string","enum":["start","status","tail","kill","list"]},
             "cmd":{"type":"string"},"cwd":{"type":"string"},"sudo":{"type":"boolean"},
-            "id":{"type":"string"},"lines":{"type":"integer","description":"default 50"}}}}
+            "id":{"type":"string"},"lines":{"type":"integer","description":"default 50"}}}},
+        {"name":"mcp","description":"Use MCP servers that run on a machine (listed under `mcp:` in `machines`). list(server?) -> each server's tools with their input schemas; call(server, tool, arguments) -> the tool's result.",
+         "inputSchema":{"type":"object","required":["machine","action"],"properties":{
+            "machine":m,"action":{"type":"string","enum":["list","call"]},
+            "server":{"type":"string","description":"MCP server name (list: optional filter)"},
+            "tool":{"type":"string","description":"tool name, for call"},
+            "arguments":{"type":"object","description":"tool arguments, for call (per the tool's input schema)"},
+            "timeout":{"type":"integer","description":"seconds, for call; default: the server's setting, max 3600"}}}}
     ])
 }
 
@@ -62,6 +72,8 @@ fn tools() -> Value {
 pub enum Reply {
     Text(String),
     Image { mime: String, data: Vec<u8>, note: String },
+    /// MCP content items (text / image) passed through from a machine's MCP server.
+    Content { items: Vec<Value>, is_error: bool },
 }
 
 impl From<String> for Reply {
@@ -135,6 +147,7 @@ async fn handle(sock: &Path, session: &Session, msg: Value) -> Option<Value> {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                     json!({"content": [{"type": "text", "text": note}, {"type": "image", "data": b64, "mimeType": mime}], "isError": false})
                 }
+                Ok(Reply::Content { items, is_error }) => json!({"content": items, "isError": is_error}),
                 Err(e) => json!({"content": [{"type": "text", "text": format!("error: {e:#}")}], "isError": true}),
             }
         }
@@ -207,7 +220,74 @@ pub async fn call(sock: &Path, session: &Session, name: &str, a: &Value) -> Resu
             o => text(o).into(),
         });
     }
+    if name == "mcp" {
+        return mcp_tool(c, m, a).await;
+    }
     call_text(c, m, name, a).await.map(Reply::Text)
+}
+
+/// Text bigger than this in an MCP result is cut and saved to a file.
+const MCP_TEXT_MAX: usize = 64 * 1024;
+
+async fn mcp_tool(c: Call<'_>, m: &str, a: &Value) -> Result<Reply> {
+    match s(a, "action")? {
+        "list" => {
+            let r = op(c, m, Op::Mcp(McpOp::List { server: os(a, "server") })).await?;
+            Ok(Reply::Text(cap_text(m, &text(r))))
+        }
+        "call" => {
+            let args = match a.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(v @ Value::Object(_)) => v.clone(),
+                // some clients send the object as a JSON string
+                Some(Value::String(t)) => serde_json::from_str::<Value>(t).ok().filter(Value::is_object).context("`arguments` must be an object")?,
+                Some(_) => bail!("`arguments` must be an object"),
+            };
+            let timeout = n(a, "timeout").unwrap_or(0).min(3600);
+            let req = McpOp::Call { server: s(a, "server")?.into(), tool: s(a, "tool")?.into(), args: args.to_string(), timeout };
+            match op(c, m, Op::Mcp(req)).await? {
+                OpOk::Mcp { content, is_error } => {
+                    let items: Vec<Value> = serde_json::from_str(&content).context("bad MCP result from the machine")?;
+                    Ok(Reply::Content { items: mcp_items(m, items), is_error })
+                }
+                o => Ok(Reply::Text(text(o))),
+            }
+        }
+        x => bail!("unknown action '{x}' (use list or call)"),
+    }
+}
+
+/// Keep text and image items, turn the rest into text, and cut huge text.
+fn mcp_items(m: &str, items: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = items
+        .into_iter()
+        .map(|it| match it.get("type").and_then(Value::as_str) {
+            Some("text") => json!({"type": "text", "text": cap_text(m, it.get("text").and_then(Value::as_str).unwrap_or(""))}),
+            Some("image") if it.get("data").is_some_and(Value::is_string) => {
+                json!({"type": "image", "data": it["data"], "mimeType": it.get("mimeType").cloned().unwrap_or(json!("image/png"))})
+            }
+            _ => json!({"type": "text", "text": cap_text(m, &it.to_string())}),
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(json!({"type": "text", "text": "(no content)"}));
+    }
+    out
+}
+
+fn cap_text(m: &str, t: &str) -> String {
+    if t.len() <= MCP_TEXT_MAX {
+        return t.to_string();
+    }
+    let mut end = MCP_TEXT_MAX;
+    while !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    let more = match format::save_full(m, t) {
+        Some(p) => format!("full text: {}", p.display()),
+        None => format!("{} more bytes", t.len() - end),
+    };
+    format!("{}\n[... cut at {} KB; {more}]", &t[..end], MCP_TEXT_MAX / 1024)
 }
 
 async fn call_text(c: Call<'_>, m: &str, name: &str, a: &Value) -> Result<String> {
@@ -273,6 +353,10 @@ fn machines_text(list: &[Listed]) -> String {
             if !l.info.folders.is_empty() {
                 s.push_str(&format!("\n    folders: {}", l.info.folders));
             }
+            if !l.info.mcp.is_empty() {
+                let servers: Vec<String> = l.info.mcp.iter().map(mcp_summary).collect();
+                s.push_str(&format!("\n    mcp: {}", servers.join(", ")));
+            }
             for line in l.info.description.trim_end().lines() {
                 s.push_str("\n    ");
                 s.push_str(line.trim_end());
@@ -281,6 +365,23 @@ fn machines_text(list: &[Listed]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// e.g. "blender (12 tools)", "comfy (ask, 3 tools)", "old (denied)".
+fn mcp_summary(x: &proto::McpInfo) -> String {
+    if x.access == "deny" {
+        return format!("{} (denied)", x.name);
+    }
+    let mut parts = vec![];
+    if x.access == "ask" {
+        parts.push("ask".to_string());
+    }
+    if x.status == "running" {
+        parts.push(format!("{} tool{}", x.tools, if x.tools == 1 { "" } else { "s" }));
+    } else {
+        parts.push(x.status.clone());
+    }
+    format!("{} ({})", x.name, parts.join(", "))
 }
 
 fn human(n: u64) -> String {

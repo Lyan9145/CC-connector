@@ -16,7 +16,7 @@ without ever showing the agent an IP address, user name or password.
 
 | Part | Runs on | What it does |
 |---|---|---|
-| `ccc-hub` | the Claude Code server | Accepts connectors, gives Claude 8 MCP tools, routes requests |
+| `ccc-hub` | the Claude Code server | Accepts connectors, gives Claude 9 MCP tools, routes requests |
 | `ccc` | your laptop | Stores connections (passwords in the OS keyring), dials the hub, executes requests |
 
 The agent only sees each machine's **name, OS, status, access rules and your notes**. You decide,
@@ -44,7 +44,7 @@ The screenshots use sample data. The window follows the system light or dark the
 - [Full guide](#full-guide)
   - [1. Server: the hub](#1-server-the-hub) ([sharing the hub between users](#sharing-the-hub-between-users))
   - [2. Laptop: the connector](#2-laptop-the-connector) ([proxy](#proxy), [network adapter](#network-adapter), [clear data](#clear-data))
-  - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters))
+  - [3. Adding machines](#3-adding-machines) ([notes for the agent](#notes-for-the-agent), [permissions](#permissions), [folders](#folders), [security filters](#security-filters), [MCP servers on the laptop](#mcp-servers-on-the-laptop))
   - [4. Using it from Claude Code](#4-using-it-from-claude-code)
 - [Agent tools reference](#agent-tools-reference)
 - [Security model](#security-model)
@@ -563,6 +563,49 @@ encodings, scripts). Real limits come from the tool permissions and folder rules
 
 ![Security tab with the built-in filters and recent alerts](docs/screenshots/security.png)
 
+#### MCP servers on the laptop
+
+A *This computer* connection can run **MCP servers** on the laptop, and the agent uses their tools
+through its `mcp` tool. For example, [Blender MCP](https://github.com/ahujasid/blender-mcp) lets
+Claude on the server look at and build scenes in Blender on your laptop:
+
+1. Install the server's prerequisites on the laptop (for Blender MCP: `uv`, and the Blender add-on,
+   connected from Blender's side panel).
+2. Open the *This computer* connection → **MCP servers** → **+ Add MCP server**: name `blender`,
+   type *Program*, command `uvx blender-mcp`. **Test** starts it once and lists its tools.
+3. **Save**. The connector starts the server and keeps it running (it is restarted if it exits),
+   and `machines` shows it to the agent, e.g. `mcp: blender (ask, 17 tools)`.
+
+No restart is needed anywhere: servers you add, remove or switch off, and tools a server adds
+while running (`notifications/tools/list_changed`), show up in the agent's next `machines` or
+`mcp list`.
+
+| Setting | Meaning |
+|---|---|
+| Type *Program* | a command line the connector starts, talking MCP over its stdin/stdout (like `claude mcp add`): `uvx …`, `npx -y …`, `python server.py` … |
+| Type *URL* | a server already listening on the laptop (Streamable HTTP), e.g. `http://127.0.0.1:8000/mcp` |
+| Folder | where a program starts (default: the connection's *Default directory*, else home) |
+| Environment / Headers | `NAME=value` lines for a program, or `Name: value` lines for a URL (e.g. an API key); kept in the OS keyring, never in `config.toml`, and redacted from what the agent sees |
+| Access | *Allow* (the agent calls its tools freely), *Ask* (you approve each call; the default), *Deny* (hidden from the agent) |
+| Timeout | default seconds per tool call (the agent may ask for another, up to an hour) |
+
+With *Ask*, the approval shows the server, the tool and its arguments; *Allow for this session*
+covers that one server only. Tool arguments also go through the [security filters](#security-filters)
+as *file content* (so e.g. Python that Blender should run is checked like a file being written).
+*Pause agent access* stops all MCP servers.
+
+From the command line:
+
+```bash
+ccc mcp add laptop blender -- uvx blender-mcp           # access: ask (default)
+ccc mcp add laptop docs --url http://127.0.0.1:8000/mcp --header 'Authorization: Bearer …' --access allow
+ccc mcp add laptop search --env API_KEY=… -- npx -y some-mcp-server
+ccc mcp test laptop blender                              # start once, list its tools
+ccc mcp list
+ccc mcp set laptop blender --access allow                # or --disable / --enable / --timeout 600
+ccc mcp rm laptop docs
+```
+
 #### Typical setups
 
 **The laptop itself (Windows or Linux):** type *This computer*. On Windows, commands run in
@@ -642,7 +685,7 @@ The MCP server is called `remote`. All results are plain text, kept short for to
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `machines` | — | one line per machine, e.g. `robot  online  linux (Ubuntu 22.04.5 LTS)  via laptop  [ask: exec; denied: sudo]`, then the owner's notes indented below it |
+| `machines` | — | one line per machine, e.g. `robot  online  linux (Ubuntu 22.04.5 LTS)  via laptop  [ask: exec; denied: sudo]`, then its MCP servers (`mcp: blender (17 tools)`) and the owner's notes indented below it |
 | `exec` | `machine`, `cmd`, `cwd`?, `timeout`? (s, default 120, max 3600), `sudo`? | `exit=<code>` then merged stdout/stderr |
 | `read` | `machine`, `path`, `offset`? (1-based line), `limit`? (default 400) | numbered lines, plus `[lines a-b of n]` when partial; for an image (PNG, JPEG, GIF, WebP, BMP) the image itself, so Claude can look at it |
 | `write` | `machine`, `path`, `content` | `ok <n> bytes` (parent folders are created) |
@@ -650,6 +693,7 @@ The MCP server is called `remote`. All results are plain text, kept short for to
 | `push` | `machine`, `src` (server path), `dst` (machine path) | `ok <files> <size>`: copies a file or folder to the machine |
 | `pull` | `machine`, `src` (machine path), `dst` (server path) | `ok <files> <size>`: copies a file or folder to the server |
 | `job` | `machine`, `action` = `start` / `status` / `tail` / `kill` / `list`, `cmd`?, `cwd`?, `sudo`?, `id`?, `lines`? | background jobs that keep running if the connection drops |
+| `mcp` | `machine`, `action` = `list` / `call`, `server`?, `tool`?, `arguments`? (object), `timeout`? (s) | `list`: each [MCP server](#mcp-servers-on-the-laptop) on the machine with its tools and their input schemas; `call`: the tool's result (text and images) |
 
 Output handling:
 
@@ -705,6 +749,10 @@ process tree.
 - **The agent can't raise its own permissions.** The connector's settings folder can't be read or
   written through the file tools, and commands that run `ccc` management commands or touch its
   config are blocked by a security filter (on by default).
+- **MCP servers are yours.** Only you add them (in the window or with `ccc mcp`); the agent can
+  list and call their tools, each server set to Allow / Ask / Deny, but can't start other programs
+  that way. What their tools do is up to the server: a server that runs code (like Blender MCP's
+  `execute_blender_code`) is as powerful as `exec`, so *Ask* is the default.
 - **Security filters** warn you about, ask you first for, or block risky commands, paths and
   file contents (see [Security filters](#security-filters)). They catch mistakes and obvious
   abuse, not a determined attacker.
@@ -747,6 +795,9 @@ process tree.
 | `ccc security set FILTER off\|warn\|ask\|block` | change a filter (built-in id or your filter's name) |
 | `ccc security add NAME 'REGEX' [--on cmd,read,write,content] [--action ask]` · `security rm NAME` | your own filters |
 | `ccc security test 'TEXT' [--on cmd]` · `ccc security enable [--off]` | try a command / turn all filters on or off |
+| `ccc mcp [list [NAME]]` | MCP servers on *This computer* connections |
+| `ccc mcp add NAME SERVER (--url URL \| -- COMMAND…) [--env K=V]… [--header 'K: V']… [--access allow\|ask\|deny] [--cwd DIR] [--timeout S]` | add or replace an MCP server |
+| `ccc mcp set NAME SERVER [--access …] [--timeout S] [--enable\|--disable]` · `mcp rm NAME SERVER` · `mcp test NAME SERVER` | change / remove / try one |
 | `ccc print-systemd` | print a systemd user unit for `ccc run` |
 
 Connection options for `add`/`edit`: `--port N`, `--key FILE`, `--password-auth`, `--password`
@@ -774,7 +825,7 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 | Hub socket for the MCP shim | `~/.config/ccc-hub/hub.sock`; `/run/ccc-hub/hub.sock` with multi-user on |
 | Saved long outputs | `/tmp/ccc-out/` on the server |
 | Connector settings (no secrets) | Windows `%APPDATA%\ccc\config.toml`, Linux `~/.config/ccc/config.toml` |
-| Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `proxy-password`, `conn/<name>/password`, `conn/<name>/passphrase`) |
+| Connector secrets | OS keyring, service `cc-connector` (entries `hub-token`, `proxy-password`, `conn/<name>/password`, `conn/<name>/passphrase`, `conn/<name>/mcp/<server>`) |
 | Connector statistics | `stats.json` next to the connector config |
 | Background jobs | `~/.ccc/jobs/` on each target machine |
 
@@ -808,7 +859,10 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 | "blocked by the owner's security filter …" | A filter set to *Block* matched. Check the **Security** tab; change the filter if it was a false alarm. |
 | "could not resolve the path on the machine (it needs GNU realpath)" | Folder rules on an SSH machine need `realpath -m` (coreutils). Install coreutils, or remove the folder rules for that machine. |
 | "the connector's own settings folder is off-limits" | By design: the agent can't touch the connector's config. |
-| "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.4.x). Update the older one. |
+| "hub closed the connection: connector v… does not match hub v…" | Hub and connector must have the same major.minor version (e.g. both 0.5.x). Update the older one. |
+| An MCP server shows **error: cannot start '…': program not found** | The program isn't on the laptop's `PATH` for the connector (e.g. `uv` installed after the connector started: restart the connector), or give its full path. |
+| An MCP server shows **error: the server exited (…)** | Its last output is shown after the error; **Test** in its settings shows more. Fix what it complains about (e.g. Blender not running / its add-on not connected). |
+| "MCP server '…' has no tool '…'" | The server's tools changed; the agent should run `mcp` with `action=list` again. |
 | "OS keyring unavailable" on Linux | Start a desktop session / gnome-keyring, or set `CCC_SECRETS=file`. |
 | Claude Code doesn't show the `remote` tools | Start a new session; check `claude mcp list`. |
 | On a shared hub, `machines` lists nothing / "unknown machine" | That machine's token doesn't list you: its creator runs `ccc-hub token share NAME <you>`. `ccc-hub token list` shows what you may use. |
@@ -823,6 +877,10 @@ Network adapter: `--adapter NAME` (from `ccc adapters`) or `--adapter auto`.
 - Folder rules apply to the file tools only, not to commands; security filters match text
   patterns and can be evaded.
 - Redaction is best effort (see [Security model](#security-model)).
+- MCP servers run only on the laptop itself (*This computer*), not on SSH machines. Only tools
+  are offered (no MCP prompts or resources), and servers can't ask the agent for anything
+  (sampling, elicitation). URL servers must speak Streamable HTTP (not the older SSE-only
+  transport).
 
 ---
 

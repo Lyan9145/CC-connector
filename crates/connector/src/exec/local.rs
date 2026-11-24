@@ -108,7 +108,7 @@ fn command(script: &str) -> Command {
     c
 }
 
-async fn kill_tree(pid: Option<u32>) {
+pub async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     if cfg!(windows) {
         let mut k = Command::new("taskkill");

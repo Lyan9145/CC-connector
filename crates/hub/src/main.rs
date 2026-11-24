@@ -233,6 +233,18 @@ async fn main() -> Result<()> {
                     println!("{note}\n[image {mime}, {} bytes, saved to {}]", data.len(), p.display());
                     Ok(())
                 }
+                Ok(mcp::Reply::Content { items, is_error }) => {
+                    for it in &items {
+                        match it.get("text").and_then(serde_json::Value::as_str) {
+                            Some(t) => println!("{t}"),
+                            None => println!("[{} {}]", it["type"].as_str().unwrap_or("?"), it["mimeType"].as_str().unwrap_or("")),
+                        }
+                    }
+                    if is_error {
+                        std::process::exit(1)
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     println!("error: {e:#}");
                     std::process::exit(1)

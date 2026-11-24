@@ -39,6 +39,17 @@ impl Redactor {
         out
     }
 
+    /// Redact the text items of MCP content (a JSON array).
+    fn mcp_content(&self, content: String) -> String {
+        let Ok(mut items) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else { return self.text(&content) };
+        for it in &mut items {
+            if let Some(serde_json::Value::String(t)) = it.get_mut("text") {
+                *t = self.text(t);
+            }
+        }
+        serde_json::Value::Array(items).to_string()
+    }
+
     pub fn result(&self, r: OpResult) -> OpResult {
         match r {
             Err(e) => Err(self.text(&e)),
@@ -48,6 +59,7 @@ impl Redactor {
             }
             Ok(OpOk::Text(t)) => Ok(OpOk::Text(self.text(&t))),
             Ok(OpOk::Image { mime, data, note }) => Ok(OpOk::Image { mime, data, note: self.text(&note) }),
+            Ok(OpOk::Mcp { content, is_error }) => Ok(OpOk::Mcp { content: self.mcp_content(content), is_error }),
             other => other,
         }
     }

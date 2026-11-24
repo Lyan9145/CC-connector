@@ -29,6 +29,20 @@ pub struct MachineInfo {
     /// Folder rules for the file tools, e.g. "~/proj: read & write; elsewhere: ask"
     /// (empty = no folder limits).
     pub folders: String,
+    /// MCP servers the owner runs on this machine.
+    pub mcp: Vec<McpInfo>,
+}
+
+/// An MCP server on a machine, as the agent sees it in `machines`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpInfo {
+    pub name: String,
+    /// "running", "starting", "error: ..." (redacted)
+    pub status: String,
+    /// number of tools it offers (0 while not running)
+    pub tools: u32,
+    /// "allow", "ask" or "deny"
+    pub access: String,
 }
 
 /// One agent session (one Claude Code process / MCP shim). Folder access
@@ -51,10 +65,11 @@ pub enum Tool {
     Push,
     Pull,
     Job,
+    Mcp,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 7] = [Tool::Exec, Tool::Read, Tool::Write, Tool::Edit, Tool::Push, Tool::Pull, Tool::Job];
+    pub const ALL: [Tool; 8] = [Tool::Exec, Tool::Read, Tool::Write, Tool::Edit, Tool::Push, Tool::Pull, Tool::Job, Tool::Mcp];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -65,6 +80,7 @@ impl Tool {
             Tool::Push => "push",
             Tool::Pull => "pull",
             Tool::Job => "job",
+            Tool::Mcp => "mcp",
         }
     }
 
@@ -84,6 +100,7 @@ impl Tool {
                 | (Tool::Push, Op::Mkdir { .. } | Op::WriteChunk { .. })
                 | (Tool::Pull, Op::List { .. } | Op::ReadChunk { .. })
                 | (Tool::Job, Op::Job(_))
+                | (Tool::Mcp, Op::Mcp(_))
         )
     }
 }
@@ -114,6 +131,15 @@ pub enum JobOp {
     List,
 }
 
+/// Talking to an MCP server on the machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum McpOp {
+    /// The servers (or one server) and their tools with input schemas.
+    List { server: Option<String> },
+    /// Call one tool; `args` is a JSON object, `timeout` in seconds.
+    Call { server: String, tool: String, args: String, timeout: u64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Op {
     Exec { cmd: String, cwd: Option<String>, timeout: u64, sudo: bool },
@@ -131,6 +157,7 @@ pub enum Op {
     },
     Mkdir { path: String },
     Job(JobOp),
+    Mcp(McpOp),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,6 +177,8 @@ pub enum OpOk {
         /// e.g. "photo.jpg: 4032x3024 JPEG, sent as 1568x1176 JPEG (212 KB)"
         note: String,
     },
+    /// An MCP tool result: `content` is the JSON array of MCP content items.
+    Mcp { content: String, is_error: bool },
 }
 
 pub type OpResult = Result<OpOk, String>;
@@ -300,6 +329,8 @@ mod tests {
         let r = Up::Resp { id: 1, result: Err("boom".into()) };
         let d: Up = decode(&encode(&r)).unwrap();
         assert!(matches!(d, Up::Resp { result: Err(e), .. } if e == "boom"));
+        let r = Up::Resp { id: 2, result: Ok(OpOk::Mcp { content: "[]".into(), is_error: true }) };
+        assert!(matches!(decode::<Up>(&encode(&r)).unwrap(), Up::Resp { result: Ok(OpOk::Mcp { is_error: true, .. }), .. }));
     }
 
     #[test]
@@ -307,6 +338,9 @@ mod tests {
         assert!(Tool::Pull.permits(&Op::List { path: "/".into() }));
         assert!(!Tool::Read.permits(&Op::Exec { cmd: "x".into(), cwd: None, timeout: 1, sudo: false }));
         assert_eq!(Tool::parse("job"), Some(Tool::Job));
+        assert_eq!(Tool::parse("mcp"), Some(Tool::Mcp));
+        assert!(Tool::Mcp.permits(&Op::Mcp(McpOp::List { server: None })));
+        assert!(!Tool::Exec.permits(&Op::Mcp(McpOp::List { server: None })));
         assert!(compatible("0.3.0", "0.3.7"));
         assert!(!compatible("0.2.1", "0.3.0"));
     }

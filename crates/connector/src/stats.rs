@@ -31,8 +31,10 @@ pub struct Counts {
     /// approval pop-ups shown / approved by the owner
     pub asked: u32,
     pub approved: u32,
-    /// calls per tool, in `Tool::ALL` order
-    pub tools: [u32; 7],
+    /// calls per tool, in `Tool::ALL` order (files from before a tool was
+    /// added have fewer entries; the rest count from zero)
+    #[serde(deserialize_with = "tool_counts")]
+    pub tools: [u32; TOOLS],
     /// operation durations, binned by `LAT_BOUNDS`
     pub lat: [u32; 10],
     /// bytes server -> machine (push, write) and machine -> server (pull)
@@ -51,7 +53,7 @@ impl Counts {
         self.refused += o.refused;
         self.asked += o.asked;
         self.approved += o.approved;
-        for i in 0..7 {
+        for i in 0..TOOLS {
             self.tools[i] += o.tools[i];
         }
         for i in 0..LAT_BOUNDS.len() {
@@ -88,6 +90,17 @@ impl Counts {
     pub fn availability(&self) -> Option<f64> {
         (self.samples > 0).then(|| self.online as f64 / self.samples as f64)
     }
+}
+
+const TOOLS: usize = Tool::ALL.len();
+
+fn tool_counts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u32; TOOLS], D::Error> {
+    let v = Vec::<u32>::deserialize(d)?;
+    let mut out = [0; TOOLS];
+    for (o, x) in out.iter_mut().zip(v) {
+        *o = x;
+    }
+    Ok(out)
 }
 
 pub fn tool_index(t: Tool) -> usize {
@@ -378,6 +391,10 @@ mod tests {
         assert_eq!((v.total.ok, v.total.failed, v.total.refused), (0, 1, 1));
         assert_eq!(v.total.up, 200);
         assert_eq!(v.total.tools[tool_index(Tool::Push)], 1);
+        // counts saved before `mcp` existed (7 tools) still load
+        let old: Counts = serde_json::from_str(r#"{"calls":3,"tools":[1,0,0,0,2,0,0]}"#).unwrap();
+        assert_eq!(old.tools[tool_index(Tool::Push)], 2);
+        assert_eq!(old.tools[tool_index(Tool::Mcp)], 0);
         assert_eq!(v.total.quantile_ms(0.5), Some(50));
         let d = demo();
         let v = d.view(Range::Week, Some("robot"), now_secs());

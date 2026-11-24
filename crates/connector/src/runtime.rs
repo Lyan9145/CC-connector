@@ -7,9 +7,10 @@ use crate::ops::{self, Ctx, Target};
 use crate::paths::{self, Resolved, Style};
 use crate::redact::Redactor;
 use crate::stats::{Outcome, Stats};
-use crate::store::{self, Access, Config, Connection, FilterAction, FolderAccess, Kind, Perm, Secrets, Tool};
+use crate::store::{self, Access, Config, Connection, FilterAction, FolderAccess, Kind, McpTransport, Perm, Secrets, Tool};
 use anyhow::{Context, Result};
-use ccc_proto::{self as proto, Down, JobOp, MachineInfo, Op, Session, Up};
+use crate::mcp;
+use ccc_proto::{self as proto, Down, JobOp, MachineInfo, McpInfo, McpOp, Op, OpOk, Session, Up};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -139,6 +140,9 @@ pub struct Alert {
 /// Folders granted to one tool call only: ((machine, folder key, write), when).
 type CallFolders = (Vec<(String, String, bool)>, Instant);
 
+/// An MCP server: (connection, server name).
+type McpKey = (String, String);
+
 /// Sessions unused this long are forgotten.
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 3600);
 
@@ -190,6 +194,11 @@ pub struct Runtime {
     pub alerts: Mutex<VecDeque<Alert>>,
     /// alerts the owner hasn't looked at yet
     pub alerts_unseen: AtomicUsize,
+    /// MCP servers' environment variables / HTTP headers (from the keyring),
+    /// by (connection, server)
+    mcp_secrets: RwLock<HashMap<McpKey, Vec<(String, String)>>>,
+    /// running MCP servers, by (connection, server)
+    mcp: Mutex<HashMap<McpKey, Arc<mcp::Client>>>,
 }
 
 fn mtime() -> Option<SystemTime> {
@@ -229,6 +238,8 @@ impl Runtime {
             filter_errors: Default::default(),
             alerts: Default::default(),
             alerts_unseen: AtomicUsize::new(0),
+            mcp_secrets: Default::default(),
+            mcp: Default::default(),
         });
         if let Err(e) = rt.reload() {
             rt.push_log(format!("config error: {e:#}"));
@@ -262,6 +273,18 @@ impl Runtime {
                 Err(e) => errs.push(format!("{e:#}")),
             }
         }
+        let mut mcp_secrets = HashMap::new();
+        for c in cfg.connections.iter().filter(|c| c.kind == Kind::Local) {
+            for m in &c.mcp {
+                let sep = if m.transport == McpTransport::Http { ':' } else { '=' };
+                match store::get_secret(&store::mcp_key(&c.name, &m.name)).map(|t| store::parse_pairs(&t.unwrap_or_default(), sep)) {
+                    Ok(Ok(v)) => {
+                        mcp_secrets.insert((c.name.clone(), m.name.clone()), v);
+                    }
+                    Ok(Err(e)) | Err(e) => errs.push(format!("MCP server '{}' on '{}': {e:#}", m.name, c.name)),
+                }
+            }
+        }
         let token = store::get_secret(store::HUB_TOKEN).unwrap_or_else(|e| {
             errs.push(format!("{e:#}"));
             None
@@ -281,6 +304,9 @@ impl Runtime {
         }
         if let Some(t) = &token {
             Redactor::add_secret(&mut pats, t);
+        }
+        for (_, v) in mcp_secrets.values().flatten() {
+            Redactor::add_secret(&mut pats, v);
         }
         let proxy_pw = if cfg.proxy.user.is_empty() {
             None
@@ -339,6 +365,7 @@ impl Runtime {
         *self.redactor.write().unwrap() = Redactor::new(pats);
         *self.targets.write().unwrap() = targets;
         *self.secrets.write().unwrap() = secrets;
+        *self.mcp_secrets.write().unwrap() = mcp_secrets;
         *self.hub_token.write().unwrap() = token;
         *self.proxy_pw.write().unwrap() = proxy_pw;
         *self.cfg.write().unwrap() = cfg;
@@ -388,10 +415,29 @@ impl Runtime {
         }
         let st = self.status.lock().unwrap();
         let red = self.redactor.read().unwrap();
+        let clients = self.mcp.lock().unwrap();
         cfg.connections
             .iter()
             .filter(|c| c.enabled)
             .map(|c| {
+                let mcp = if c.kind != Kind::Local {
+                    vec![]
+                } else {
+                    c.mcp
+                        .iter()
+                        .filter(|m| m.enabled)
+                        .map(|m| {
+                            let st = clients.get(&(c.name.clone(), m.name.clone())).map(|x| x.state()).unwrap_or_default();
+                            let running = st.status == "running";
+                            McpInfo {
+                                name: m.name.clone(),
+                                status: if st.status.is_empty() { "starting".into() } else { red.text(&st.status) },
+                                tools: if running { st.tools.len() as u32 } else { 0 },
+                                access: m.access.key().into(),
+                            }
+                        })
+                        .collect()
+                };
                 let s = st.get(&c.name).cloned().unwrap_or_default();
                 let mut perms = c.perms;
                 if c.kind == Kind::Local && cfg!(windows) {
@@ -405,9 +451,110 @@ impl Runtime {
                     ask: perms.names_with(Access::Ask),
                     denied: perms.names_with(Access::Deny),
                     folders: c.folders_summary(),
+                    mcp,
                 }
             })
             .collect()
+    }
+
+    /// Start, restart or stop MCP servers to match the config.
+    fn sync_mcp(self: &Arc<Self>) {
+        let (want, paused) = {
+            let cfg = self.cfg.read().unwrap();
+            let secrets = self.mcp_secrets.read().unwrap();
+            let mut want = vec![];
+            for c in cfg.connections.iter().filter(|c| c.enabled && c.kind == Kind::Local) {
+                for m in c.mcp.iter().filter(|m| m.enabled) {
+                    let cwd = mcp::work_dir(c, m);
+                    let key = (c.name.clone(), m.name.clone());
+                    let sec = secrets.get(&key).cloned().unwrap_or_default();
+                    want.push((key, m.clone(), cwd, sec));
+                }
+            }
+            (want, cfg.paused)
+        };
+        let want = if paused { vec![] } else { want };
+        let mut map = self.mcp.lock().unwrap();
+        map.retain(|k, cl| {
+            let keep = want.iter().any(|(wk, m, cwd, sec)| wk == k && cl.same(m, cwd, sec));
+            if !keep {
+                cl.stop();
+            }
+            keep
+        });
+        for (key, m, cwd, sec) in want {
+            if map.contains_key(&key) {
+                continue;
+            }
+            let me = Arc::downgrade(self);
+            let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if let Some(me) = me.upgrade() {
+                    me.changed.send_modify(|v| *v += 1);
+                    me.notify();
+                }
+            });
+            let me = Arc::downgrade(self);
+            let log: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |s| {
+                if let Some(me) = me.upgrade() {
+                    let s = me.redactor.read().unwrap().text(&s);
+                    me.push_log(s);
+                }
+            });
+            let cl = mcp::Client::new(format!("{}/{}", key.0, key.1), m, cwd, sec, on_change, log);
+            cl.start();
+            map.insert(key, cl);
+        }
+        drop(map);
+        self.changed.send_modify(|v| *v += 1);
+    }
+
+    /// The state of one MCP server (None when it isn't running).
+    pub fn mcp_state(&self, conn: &str, server: &str) -> Option<mcp::State> {
+        self.mcp.lock().unwrap().get(&(conn.to_string(), server.to_string())).map(|c| c.state())
+    }
+
+    /// Carry out an `mcp` request (already authorized).
+    async fn mcp_op(&self, conn: &Connection, op: McpOp) -> Result<OpOk> {
+        let m = &conn.name;
+        if conn.kind != Kind::Local {
+            anyhow::bail!("'{m}' has no MCP servers (only \"This computer\" connections can have them)");
+        }
+        let names = || {
+            let v: Vec<&str> = conn.mcp.iter().filter(|x| x.enabled && x.access != Access::Deny).map(|x| x.name.as_str()).collect();
+            if v.is_empty() { "(none)".to_string() } else { v.join(", ") }
+        };
+        let client = |s: &str| self.mcp.lock().unwrap().get(&(m.clone(), s.to_string())).cloned();
+        match op {
+            McpOp::List { server } => {
+                if let Some(s) = &server {
+                    if !conn.mcp.iter().any(|x| x.name == *s && x.enabled) {
+                        anyhow::bail!("no MCP server '{s}' on '{m}'. Its servers: {}", names());
+                    }
+                }
+                let red = self.redactor.read().unwrap().clone();
+                let list: Vec<(String, String, mcp::State)> = conn
+                    .mcp
+                    .iter()
+                    .filter(|x| x.enabled && x.access != Access::Deny && server.as_ref().is_none_or(|s| *s == x.name))
+                    .map(|x| {
+                        let mut st = client(&x.name).map(|c| c.state()).unwrap_or_default();
+                        st.status = if st.status.is_empty() { "starting".into() } else { red.text(&st.status) };
+                        (x.name.clone(), x.access.key().to_string(), st)
+                    })
+                    .collect();
+                Ok(OpOk::Text(mcp::list_text(&list)))
+            }
+            McpOp::Call { server, tool, args, timeout } => {
+                let Some(cfg) = conn.mcp_server(&server).filter(|x| x.enabled) else {
+                    anyhow::bail!("no MCP server '{server}' on '{m}'. Its servers: {}", names());
+                };
+                let Some(c) = client(&server) else { anyhow::bail!("MCP server '{server}' is not running") };
+                let args: serde_json::Value = serde_json::from_str(&args).context("arguments are not valid JSON")?;
+                let secs = if timeout == 0 { cfg.timeout } else { timeout }.clamp(1, 3600);
+                let (content, is_error) = c.call(&tool, args, Duration::from_secs(secs)).await?;
+                Ok(OpOk::Mcp { content, is_error })
+            }
+        }
     }
 
     fn set_status(&self, name: &str, status: String, os: Option<String>) {
@@ -446,6 +593,17 @@ impl Runtime {
     }
 
     pub fn start(self: &Arc<Self>) {
+        // MCP servers: start now, and follow config changes
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut rx = me.reloaded.subscribe();
+            loop {
+                me.sync_mcp();
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
         // config file watcher (CLI edits while GUI/headless runs)
         let me = self.clone();
         tokio::spawn(async move {
@@ -685,6 +843,8 @@ impl Runtime {
                 ccc_proto::JobOp::Kill { id } => format!("job kill {id}"),
                 ccc_proto::JobOp::List => "job list".into(),
             },
+            Op::Mcp(McpOp::List { server }) => format!("mcp list{}", server.as_ref().map(|s| format!(" {s}")).unwrap_or_default()),
+            Op::Mcp(McpOp::Call { server, tool, .. }) => format!("mcp {server}.{tool}"),
         })
     }
 
@@ -729,6 +889,18 @@ impl Runtime {
                 JobOp::Status { id } | JobOp::Tail { id, .. } => format!("look at job {id}"),
                 JobOp::List => "list jobs".into(),
             },
+            Op::Mcp(McpOp::List { .. }) => "list MCP tools".into(),
+            Op::Mcp(McpOp::Call { server, tool, args, timeout }) => {
+                let pretty = serde_json::from_str::<serde_json::Value>(args)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                    .unwrap_or_else(|| args.clone());
+                let mut d = format!("MCP server \"{server}\", tool \"{tool}\"\n\n{}", cap(&pretty, 4000));
+                if *timeout > 0 {
+                    d.push_str(&format!("\ntimeout {timeout}s"));
+                }
+                d
+            }
         }
     }
 
@@ -879,7 +1051,11 @@ impl Runtime {
         }
 
         // security filters
-        let subjects = filters::subjects(op, place.as_ref().map(|p| p.0.abs.as_str()));
+        let mut subjects = filters::subjects(op, place.as_ref().map(|p| p.0.abs.as_str()));
+        // MCP tool arguments (e.g. code for Blender to run) count as content
+        if let Op::Mcp(McpOp::Call { args, .. }) = op {
+            subjects.push((filters::Scope::Content, args.clone()));
+        }
         let hits = filters::check(&self.filters.read().unwrap(), &subjects);
         if let Some(h) = hits.iter().find(|h| h.action == FilterAction::Block) {
             self.alert(m, std::slice::from_ref(h), &what, "blocked");
@@ -893,7 +1069,30 @@ impl Runtime {
 
         // tool permissions
         let sudo = matches!(op, Op::Exec { sudo: true, .. } | Op::Job(JobOp::Start { sudo: true, .. }));
-        let tool_level = conn.perms.get(Perm::Tool(tool));
+        // MCP: each server has its own access level
+        let mcp_server = match op {
+            Op::Mcp(McpOp::Call { server, .. } | McpOp::List { server: Some(server) }) => Some(server.as_str()),
+            _ => None,
+        };
+        let tool_level = match (tool, mcp_server) {
+            // a switched-off server is treated as unknown (`mcp_op` says so)
+            (Tool::Mcp, Some(s)) => match conn.mcp_server(s).filter(|x| x.enabled) {
+                Some(srv) if srv.access == Access::Deny => {
+                    self.push_log(format!("{m}: refused `{what}` (MCP server not allowed)"));
+                    return Err(format!("the owner of '{m}' does not allow the MCP server '{s}'"));
+                }
+                // listing is harmless
+                Some(srv) if matches!(op, Op::Mcp(McpOp::Call { .. })) => srv.access,
+                _ => Access::Allow,
+            },
+            (Tool::Mcp, None) => Access::Allow,
+            _ => conn.perms.get(Perm::Tool(tool)),
+        };
+        // what grants are kept for: the machine, or one MCP server on it
+        let gm = match mcp_server {
+            Some(s) => format!("{m}/{s}"),
+            None => m.to_string(),
+        };
         let mut level = tool_level;
         // looking at jobs is harmless; only start/kill need approval
         if level == Access::Ask && matches!(op, Op::Job(JobOp::Status { .. } | JobOp::Tail { .. } | JobOp::List)) {
@@ -961,13 +1160,14 @@ impl Runtime {
             return Err(format!("the owner refused this request on '{m}'"));
         }
         let approved_call = decided == Some(true);
-        let tool_ask = level == Access::Ask && !approved_call && !self.tool_granted(session.id, m, tool, sudo);
+        let tool_ask = level == Access::Ask && !approved_call && !self.tool_granted(session.id, &gm, tool, sudo);
         let flag_ask = flagged && !approved_call;
         if !tool_ask && !flag_ask && folder.is_none() {
             self.alert(m, &hits, &what, "allowed");
             return Ok(());
         }
         let mut why = match &folder {
+            _ if mcp_server.is_some() => format!("`{what}`"),
             Some(f) if !tool_ask && !flag_ask => format!("access to {}", f.target),
             Some(f) => format!("`{}`{} in {}", tool.name(), if sudo { " with sudo" } else { "" }, f.target),
             None => format!("`{}`{}", tool.name(), if sudo { " with sudo" } else { "" }),
@@ -1067,13 +1267,13 @@ impl Runtime {
                 Decision::Once => self.push_log(format!("{m}: you approved {why}")),
                 Decision::Session => {
                     self.session_mut(session, |s| {
-                        s.tools.insert((m.to_string(), tool, sudo));
+                        s.tools.insert((gm.clone(), tool, sudo));
                     });
-                    self.push_log(format!("{m}: you allowed `{}`{} for this session", tool.name(), if sudo { " with sudo" } else { "" }));
+                    self.push_log(format!("{gm}: you allowed `{}`{} for this session", tool.name(), if sudo { " with sudo" } else { "" }));
                 }
                 Decision::For(dur) => {
-                    self.grants.lock().unwrap().insert((m.to_string(), tool, sudo), Instant::now() + dur);
-                    self.push_log(format!("{m}: you allowed `{}`{} for {} min", tool.name(), if sudo { " with sudo" } else { "" }, dur.as_secs() / 60));
+                    self.grants.lock().unwrap().insert((gm.clone(), tool, sudo), Instant::now() + dur);
+                    self.push_log(format!("{gm}: you allowed `{}`{} for {} min", tool.name(), if sudo { " with sudo" } else { "" }, dur.as_secs() / 60));
                 }
                 Decision::Deny => {}
             }
@@ -1293,7 +1493,10 @@ impl Runtime {
         let secrets = self.secrets.read().unwrap().get(machine).cloned().unwrap_or_default();
         let ctx = Ctx { target: &target, conn: &conn, secrets: &secrets };
         self.run_begin(call, machine, tool, Self::summarize(&op), &session.label);
-        let res = ops::handle(&ctx, op).await;
+        let res = match op {
+            Op::Mcp(mop) => self.mcp_op(&conn, mop).await.map_err(|e| format!("{e:#}")),
+            op => ops::handle(&ctx, op).await,
+        };
         self.run_end(call);
         if let Err(e) = &res {
             self.push_log(format!("{machine}: error: {}", self.redactor.read().unwrap().text(e)));
@@ -1522,6 +1725,64 @@ mod tests {
         std::env::set_var("CCC_DIR", std::env::temp_dir().join(format!("ccc-test-cfg-{}", std::process::id())));
         std::env::set_var("CCC_SECRETS", "file");
         (dir, Runtime::new(false))
+    }
+
+    #[tokio::test]
+    async fn mcp_permissions() {
+        let (_dir, rt) = setup("mcp");
+        let t = Target::Local;
+        let s1 = sess(41);
+        let srv = |name: &str, access| store::McpServer { name: name.into(), command: "x".into(), access, ..Default::default() };
+        let conn = Connection {
+            name: "pc".into(),
+            kind: Kind::Local,
+            mcp: vec![srv("blender", Access::Ask), srv("calc", Access::Ask), srv("secret", Access::Deny), srv("free", Access::Allow)],
+            ..Default::default()
+        };
+        let call = |server: &str, args: &str| Op::Mcp(McpOp::Call { server: server.into(), tool: "t".into(), args: args.into(), timeout: 0 });
+        let list = |server: Option<&str>| Op::Mcp(McpOp::List { server: server.map(String::from) });
+
+        // listing is free, except a denied server
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 1, &s1, &list(None)).await.is_ok());
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 2, &s1, &list(Some("blender"))).await.is_ok());
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 3, &s1, &list(Some("secret"))).await.unwrap_err();
+        assert!(e.contains("does not allow the MCP server 'secret'"), "{e}");
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 4, &s1, &call("secret", "{}")).await.unwrap_err();
+        assert!(e.contains("does not allow"), "{e}");
+        // allowed server, and `mcp` can't carry other ops (nor others `mcp`)
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 5, &s1, &call("free", "{}")).await.is_ok());
+        assert!(rt.authorize(&conn, &t, Tool::Exec, 6, &s1, &call("free", "{}")).await.is_err());
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 7, &s1, &op_exec(false)).await.is_err());
+
+        // ask: headless is refused; the approval names server and tool
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 8, &s1, &call("blender", "{}")).await.unwrap_err();
+        assert!(e.contains("`mcp blender.t`") && e.contains("without its window"), "{e}");
+        rt.interactive.store(true, Ordering::Relaxed);
+        let h = auto_answer(&rt, ans(Decision::Session));
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 9, &s1, &call("blender", r#"{"code":"print(1)"}"#)).await.is_ok());
+        h.abort();
+        // a switched-off server isn't asked about
+        let mut off = conn.clone();
+        off.mcp[0].enabled = false;
+        assert!(rt.authorize(&off, &t, Tool::Mcp, 30, &s1, &call("blender", "{}")).await.is_ok());
+        // the session grant covers blender only (anything asked now is refused)
+        let h = auto_answer(&rt, ans(Decision::Deny));
+        assert!(rt.authorize(&conn, &t, Tool::Mcp, 10, &s1, &call("blender", "{}")).await.is_ok());
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 11, &s1, &call("calc", "{}")).await.unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        // and that session only
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 12, &sess(42), &call("blender", "{}")).await.unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        h.abort();
+
+        // tool arguments go through the content filters
+        let sec = store::Security {
+            custom: vec![store::FilterRule { name: "no-rmtree".into(), pattern: "rmtree".into(), on: vec!["content".into()], action: FilterAction::Block }],
+            ..Default::default()
+        };
+        *rt.filters.write().unwrap() = filters::build(&sec).0;
+        let e = rt.authorize(&conn, &t, Tool::Mcp, 13, &s1, &call("free", r#"{"code":"shutil.rmtree('/')"}"#)).await.unwrap_err();
+        assert!(e.contains("no-rmtree"), "{e}");
     }
 
     #[tokio::test]
