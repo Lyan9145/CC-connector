@@ -328,7 +328,9 @@ impl Client {
                 Ok(Ok(s)) => format!("the server exited ({})", s.code().map(|c| format!("exit code {c}")).unwrap_or_else(|| "killed".into())),
                 _ => "the server exited (closed its output)".into(),
             };
-            p.fail_all("the MCP server exited");
+            // requests still waiting (e.g. `initialize`) get the actual reason
+            *p.gone.lock().unwrap() = Some(why.clone());
+            p.fail_all(&why);
             let _ = p.events.send(Event::Closed(why));
         });
         Ok(peer)
@@ -471,11 +473,13 @@ struct Peer {
     events: mpsc::UnboundedSender<Event>,
     /// negotiated protocol version (sent as a header over HTTP)
     version: Mutex<Option<String>>,
+    /// why the server went away (stdio: it exited)
+    gone: Mutex<Option<String>>,
 }
 
 impl Peer {
     fn new(io: Io, events: mpsc::UnboundedSender<Event>) -> Self {
-        Peer { io, pending: Default::default(), next: AtomicU64::new(1), events, version: Mutex::new(None) }
+        Peer { io, pending: Default::default(), next: AtomicU64::new(1), events, version: Mutex::new(None), gone: Mutex::new(None) }
     }
 
     async fn request(self: &Arc<Self>, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -484,7 +488,17 @@ impl Peer {
         self.pending.lock().unwrap().insert(id, tx);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let r = tokio::time::timeout(timeout, async {
-            self.send(&msg, Some(id)).await?;
+            if let Err(e) = self.send(&msg, Some(id)).await {
+                // a program that exits at once breaks the pipe before we know why;
+                // its exit reason follows shortly
+                for _ in 0..40 {
+                    if let Some(why) = self.gone.lock().unwrap().clone() {
+                        bail!(why);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                return Err(e);
+            }
             match rx.await {
                 Ok(Ok(v)) => Ok(v),
                 Ok(Err(e)) => Err(anyhow!(e)),
