@@ -280,7 +280,7 @@ impl Client {
         let spawned = match c.spawn() {
             // `npx`, `uvx` … are often .cmd/.bat shims, which only cmd.exe runs
             #[cfg(windows)]
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && on_path(prog, &self.cwd) => {
                 let mut c = Command::new("cmd");
                 c.arg("/D").arg("/S").arg("/C").raw_arg(format!("\"{}\"", self.cfg.command));
                 setup(&mut c);
@@ -308,7 +308,6 @@ impl Client {
         // stdout: JSON-RPC messages, one per line
         let p = peer.clone();
         let me = self.clone();
-        let prog = prog.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(l)) = lines.next_line().await {
@@ -323,8 +322,6 @@ impl Client {
             }
             let status = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             let why = match status {
-                // 9009: cmd.exe (the fallback for .cmd shims) didn't find the program
-                Ok(Ok(s)) if cfg!(windows) && s.code() == Some(9009) => not_found(&prog),
                 Ok(Ok(s)) => format!("the server exited ({})", s.code().map(|c| format!("exit code {c}")).unwrap_or_else(|| "killed".into())),
                 _ => "the server exited (closed its output)".into(),
             };
@@ -401,6 +398,22 @@ pub async fn probe_with(conn: &crate::store::Connection, m: &McpServer, secret: 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     st
+}
+
+/// Whether Windows finds `prog` as a file, trying the PATHEXT extensions,
+/// in `cwd` and on PATH (only in `cwd` when it names a folder), as cmd.exe would.
+#[cfg(windows)]
+fn on_path(prog: &str, cwd: &std::path::Path) -> bool {
+    use std::path::{Path, PathBuf};
+    let exts: Vec<String> =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into()).split(';').filter(|e| !e.is_empty()).map(String::from).collect();
+    let p = Path::new(prog);
+    let bases: Vec<PathBuf> = if prog.contains(['\\', '/']) {
+        vec![cwd.join(p)]
+    } else {
+        std::iter::once(cwd.to_path_buf()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())).map(|d| d.join(p)).collect()
+    };
+    bases.iter().any(|b| (p.extension().is_some() && b.is_file()) || exts.iter().any(|e| PathBuf::from(format!("{}{e}", b.display())).is_file()))
 }
 
 fn not_found(prog: &str) -> String {
