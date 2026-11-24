@@ -1018,6 +1018,21 @@ fn action_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, a: &mut FilterActio
     });
 }
 
+/// "MCP servers" heading, a line about what they are, and the editor.
+fn mcp_section(ui: &mut egui::Ui, f: &mut Form, rt: &Runtime, tests: &HashMap<String, String>, err: Option<&str>, scroll: bool, test: &mut Option<usize>) {
+    section(ui, tr("MCP servers"));
+    ui.label(RichText::new(tr("Programs on this computer whose tools the agent can use (through its `mcp` tool), e.g. uvx blender-mcp")).weak().size(12.0));
+    ui.add_space(2.0);
+    checked(ui, err, scroll, |ui| {
+        ui.vertical(|ui| {
+            if let Some(i) = mcp_editor(ui, f, rt, tests) {
+                *test = Some(i);
+            }
+        })
+        .response
+    });
+}
+
 /// Status color and text of a saved MCP server.
 fn mcp_status(rt: &Runtime, conn: &str, m: &store::McpServer, saved: bool) -> (Color32, String) {
     if !saved {
@@ -2488,19 +2503,6 @@ impl App {
                         }
                         ui.end_row();
                     }
-                    if f.conn.kind == Kind::Local || !f.conn.mcp.is_empty() {
-                        let tip = tr("Programs on this computer whose tools the agent can use (through its `mcp` tool), e.g. uvx blender-mcp");
-                        field_label(ui, tr("MCP servers"), false).on_hover_text(tip);
-                        checked(ui, e("mcp"), sc("mcp"), |ui| {
-                            ui.vertical(|ui| {
-                                if let Some(i) = mcp_editor(ui, f, &rt, &mcp_tests) {
-                                    mcp_test = Some(i);
-                                }
-                            })
-                            .response
-                        });
-                        ui.end_row();
-                    }
                     if f.conn.kind == Kind::Ssh {
                         ui.label(tr("Host key"));
                         ui.horizontal(|ui| {
@@ -2516,6 +2518,12 @@ impl App {
                         ui.end_row();
                     }
                 });
+                // its own section, not a grid row: a grid centres the label in a row
+                // as tall as the server list, opening a gap above it
+                if f.conn.kind == Kind::Local || !f.conn.mcp.is_empty() {
+                    ui.add_space(6.0);
+                    mcp_section(ui, f, &rt, &mcp_tests, e("mcp"), sc("mcp"), &mut mcp_test);
+                }
                 if f.conn.kind == Kind::Ssh {
                     ui.add_space(6.0);
                     adapter_section(ui, "conn-adapter", &mut f.conn.iface, &adapters, tr("the SSH connection to this machine"));
@@ -3325,16 +3333,21 @@ mod tests {
             let mut f = Form { base: conn.clone(), conn: conn.clone(), orig: "laptop".into(), mcp: rows.clone(), mcp_loaded: true, ..Default::default() };
             let rt = rt.clone();
             let tests = tests.clone();
-            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(820.0, 560.0)).wgpu().build(move |ctx| {
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(820.0, 640.0)).wgpu().build(move |ctx| {
                 harness_theme(ctx, dark);
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    // the rows above, to see the spacing
                     egui::Grid::new("form").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-                        field_label(ui, tr("MCP servers"), false);
-                        ui.vertical(|ui| {
-                            let _ = mcp_editor(ui, &mut f, &rt, &tests);
-                        });
+                        ui.label(tr("Default directory"));
+                        ui.text_edit_singleline(&mut String::new());
+                        ui.end_row();
+                        ui.label(tr("Agent access"));
+                        ui.checkbox(&mut true, tr("Visible to the agent"));
                         ui.end_row();
                     });
+                    ui.add_space(6.0);
+                    let mut t = None;
+                    mcp_section(ui, &mut f, &rt, &tests, None, false, &mut t);
                 });
             });
             for _ in 0..6 {

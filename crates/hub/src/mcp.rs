@@ -58,11 +58,11 @@ fn tools() -> Value {
             "machine":m,"action":{"type":"string","enum":["start","status","tail","kill","list"]},
             "cmd":{"type":"string"},"cwd":{"type":"string"},"sudo":{"type":"boolean"},
             "id":{"type":"string"},"lines":{"type":"integer","description":"default 50"}}}},
-        {"name":"mcp","description":"Use MCP servers that run on a machine (listed under `mcp:` in `machines`). list(server?) -> each server's tools with their input schemas; call(server, tool, arguments) -> the tool's result.",
+        {"name":"mcp","description":"Use MCP servers that run on a machine (listed under `mcp:` in `machines`). list(server?) -> each server's tools: name(parameters) and a one-line summary; list(server?, tool) -> that tool's full description and input schema (check it before the first call); call(server, tool, arguments) -> the tool's result.",
          "inputSchema":{"type":"object","required":["machine","action"],"properties":{
             "machine":m,"action":{"type":"string","enum":["list","call"]},
             "server":{"type":"string","description":"MCP server name (list: optional filter)"},
-            "tool":{"type":"string","description":"tool name, for call"},
+            "tool":{"type":"string","description":"tool name: for call; for list, show that tool's full description and input schema"},
             "arguments":{"type":"object","description":"tool arguments, for call (per the tool's input schema)"},
             "timeout":{"type":"integer","description":"seconds, for call; default: the server's setting, max 3600"}}}}
     ])
@@ -233,7 +233,12 @@ async fn mcp_tool(c: Call<'_>, m: &str, a: &Value) -> Result<Reply> {
     match s(a, "action")? {
         "list" => {
             let r = op(c, m, Op::Mcp(McpOp::List { server: os(a, "server") })).await?;
-            Ok(Reply::Text(cap_text(m, &text(r))))
+            let listing = parse_listing(&text(r));
+            let out = match os(a, "tool") {
+                Some(t) => tool_detail(&listing, &t)?,
+                None => brief_listing(&listing),
+            };
+            Ok(Reply::Text(cap_text(m, &out)))
         }
         "call" => {
             let args = match a.get("arguments") {
@@ -255,6 +260,142 @@ async fn mcp_tool(c: Call<'_>, m: &str, a: &Value) -> Result<Reply> {
         }
         x => bail!("unknown action '{x}' (use list or call)"),
     }
+}
+
+/// One server in the connector's `mcp list` text.
+#[derive(Debug, Default)]
+struct ListedServer {
+    /// "name  status  [server info]  (note)"
+    head: String,
+    tools: Vec<ListedTool>,
+    /// other indented lines, e.g. "  (no tools)"
+    other: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ListedTool {
+    name: String,
+    description: Vec<String>,
+    /// the input schema (compact JSON)
+    input: String,
+}
+
+/// Read the connector's full listing back (its layout: a server line, then
+/// per tool "  name: first line", "      more lines", "    input: {schema}").
+fn parse_listing(t: &str) -> Vec<ListedServer> {
+    let mut out: Vec<ListedServer> = vec![];
+    for line in t.lines() {
+        if !line.starts_with(' ') {
+            out.push(ListedServer { head: line.to_string(), ..Default::default() });
+            continue;
+        }
+        let Some(srv) = out.last_mut() else { continue };
+        if let Some(rest) = line.strip_prefix("    input: ") {
+            if let Some(tool) = srv.tools.last_mut() {
+                tool.input = rest.to_string();
+            }
+        } else if let Some(rest) = line.strip_prefix("      ") {
+            if let Some(tool) = srv.tools.last_mut() {
+                tool.description.push(rest.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("  ").filter(|r| !r.starts_with([' ', '('])) {
+            let (name, first) = match rest.split_once(": ") {
+                Some((n, d)) if !n.contains(' ') => (n, Some(d)),
+                _ => (rest, None),
+            };
+            srv.tools.push(ListedTool { name: name.to_string(), description: first.map(|d| vec![d.to_string()]).unwrap_or_default(), input: String::new() });
+        } else {
+            srv.other.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// Parameter names from an input schema: `a, b?` (optional ones marked
+/// `?`). A parameter that is itself an object shows its fields one level
+/// down, e.g. `input_data{depth, draft_angle?}` (servers built on pydantic
+/// models put everything in one such object).
+fn params(schema: &str) -> String {
+    let Ok(root) = serde_json::from_str::<Value>(schema) else { return String::new() };
+    fn fields(root: &Value, v: &Value, nested: bool) -> String {
+        // `{"$ref": "#/$defs/Name"}`, possibly inside allOf / anyOf
+        let resolve = |v: &Value| -> Option<Value> {
+            let r = v.get("$ref").and_then(Value::as_str)?;
+            let mut cur = root;
+            for part in r.strip_prefix("#/")?.split('/') {
+                cur = cur.get(part)?;
+            }
+            Some(cur.clone())
+        };
+        let v = resolve(v).unwrap_or_else(|| v.clone());
+        let Some(props) = v.get("properties").and_then(Value::as_object) else { return String::new() };
+        let required: Vec<&str> = v.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        props
+            .iter()
+            .map(|(k, p)| {
+                let mark = if required.contains(&k.as_str()) { "" } else { "?" };
+                let inner = if nested {
+                    let p = ["allOf", "anyOf"]
+                        .iter()
+                        .find_map(|c| p.get(*c).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("$ref").is_some() || x.get("properties").is_some())))
+                        .unwrap_or(p);
+                    let f = fields(root, p, false);
+                    if f.is_empty() { f } else { format!("{{{f}}}") }
+                } else {
+                    String::new()
+                };
+                format!("{k}{mark}{inner}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    fields(&root, &root, true)
+}
+
+/// Each server with one line per tool: `name(params): first sentence`.
+fn brief_listing(servers: &[ListedServer]) -> String {
+    const SUMMARY: usize = 110;
+    let mut out = String::new();
+    let mut any = false;
+    for srv in servers {
+        out.push_str(&srv.head);
+        out.push('\n');
+        for l in &srv.other {
+            out.push_str(l);
+            out.push('\n');
+        }
+        for t in &srv.tools {
+            any = true;
+            let first = t.description.first().map(String::as_str).unwrap_or("").trim();
+            let mut summary: String = first.chars().take(SUMMARY).collect();
+            if first.chars().count() > SUMMARY {
+                summary.push('…');
+            }
+            out.push_str(&format!("  {}({}){}{}\n", t.name, params(&t.input), if summary.is_empty() { "" } else { ": " }, summary));
+        }
+    }
+    if any {
+        out.push_str("[parameters marked ? are optional; list with tool=<name> shows a tool's full description and input schema]");
+    }
+    out.trim_end().to_string()
+}
+
+/// The full description and input schema of one tool.
+fn tool_detail(servers: &[ListedServer], tool: &str) -> Result<String> {
+    let hits: Vec<(&ListedServer, &ListedTool)> = servers.iter().flat_map(|s| s.tools.iter().filter(|t| t.name == tool).map(move |t| (s, t))).collect();
+    if hits.is_empty() {
+        let names: Vec<&str> = servers.iter().flat_map(|s| s.tools.iter().map(|t| t.name.as_str())).collect();
+        bail!("no tool '{tool}' here. Tools: {}", if names.is_empty() { "(none)".to_string() } else { names.join(", ") });
+    }
+    Ok(hits
+        .iter()
+        .map(|(s, t)| {
+            let server = s.head.split_whitespace().next().unwrap_or("");
+            let desc = if t.description.is_empty() { "(no description)".to_string() } else { t.description.join("\n") };
+            format!("{server} / {}\n{desc}\ninput schema: {}", t.name, if t.input.is_empty() { "{}" } else { &t.input })
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
 }
 
 /// Keep text and image items, turn the rest into text, and cut huge text.
@@ -527,4 +668,41 @@ async fn pull(c: Call<'_>, m: &str, src: &str, dst: &str) -> Result<String> {
         files += 1;
     }
     Ok(format!("ok {files} file{} {}", if files == 1 { "" } else { "s" }, human(total)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LISTING: &str = "sw  running  [SolidWorks MCP Server 3.2.4]  (each call needs the owner's approval)
+  add_circle: Add a circle to the active sketch.
+      Coordinates are in mm.
+    input: {\"properties\":{\"x\":{\"type\":\"number\"},\"r\":{\"type\":\"number\"},\"note\":{\"type\":\"string\"}},\"required\":[\"x\",\"r\"],\"type\":\"object\"}
+  exit_sketch
+    input: {\"type\":\"object\"}
+empty  running
+  (no tools)
+broken  error: the server exited (exit code 1)";
+
+    #[test]
+    fn listing_brief_and_detail() {
+        let l = parse_listing(LISTING);
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[0].tools.len(), 2);
+        let b = brief_listing(&l);
+        // one object parameter (pydantic style): its fields are shown, $refs resolved
+        let nested = r##"{"properties":{"input_data":{"$ref":"#/$defs/Ext"}},"required":["input_data"],"$defs":{"Ext":{"properties":{"depth":{"type":"number"},"draft":{"type":"number"}},"required":["depth"]}}}"##;
+        assert_eq!(params(nested), "input_data{depth, draft?}");
+        let inline = r#"{"properties":{"input_data":{"properties":{"a":{}},"type":"object"},"z":{"type":"string"}}}"#;
+        assert_eq!(params(inline), "input_data?{a?}, z?");
+        assert!(b.starts_with("sw  running  [SolidWorks MCP Server 3.2.4]  (each call needs the owner's approval)\n  add_circle(note?, r, x): Add a circle to the active sketch.\n  exit_sketch()\nempty  running\n  (no tools)\nbroken  error: the server exited (exit code 1)\n[parameters"), "{b}");
+        assert!(!b.contains("Coordinates"));
+        let d = tool_detail(&l, "add_circle").unwrap();
+        assert!(d.starts_with("sw / add_circle\nAdd a circle to the active sketch.\nCoordinates are in mm.\ninput schema: {\"properties\""), "{d}");
+        let e = tool_detail(&l, "nope").unwrap_err().to_string();
+        assert!(e.contains("Tools: add_circle, exit_sketch"), "{e}");
+        // long first lines are cut
+        let long = format!("s  running\n  t: {}\n    input: {{}}", "x".repeat(300));
+        assert!(brief_listing(&parse_listing(&long)).contains(&format!("t(): {}…", "x".repeat(110))));
+    }
 }

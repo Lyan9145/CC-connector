@@ -693,7 +693,7 @@ The MCP server is called `remote`. All results are plain text, kept short for to
 | `push` | `machine`, `src` (server path), `dst` (machine path) | `ok <files> <size>`: copies a file or folder to the machine |
 | `pull` | `machine`, `src` (machine path), `dst` (server path) | `ok <files> <size>`: copies a file or folder to the server |
 | `job` | `machine`, `action` = `start` / `status` / `tail` / `kill` / `list`, `cmd`?, `cwd`?, `sudo`?, `id`?, `lines`? | background jobs that keep running if the connection drops |
-| `mcp` | `machine`, `action` = `list` / `call`, `server`?, `tool`?, `arguments`? (object), `timeout`? (s) | `list`: each [MCP server](#mcp-servers-on-the-laptop) on the machine with its tools and their input schemas; `call`: the tool's result (text and images) |
+| `mcp` | `machine`, `action` = `list` / `call`, `server`?, `tool`?, `arguments`? (object), `timeout`? (s) | `list`: each [MCP server](#mcp-servers-on-the-laptop) on the machine, one line per tool: `name(parameters): summary`; `list` with `tool`: that tool's full description and input schema; `call`: the tool's result (text and images) |
 
 Output handling:
 
