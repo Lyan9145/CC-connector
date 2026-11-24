@@ -289,7 +289,7 @@ impl Client {
             r => r,
         };
         let mut child = spawned.map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => anyhow!("cannot start '{prog}': program not found (is it installed and on PATH?)"),
+            std::io::ErrorKind::NotFound => anyhow!(not_found(prog)),
             _ => anyhow!("cannot start '{prog}': {e}"),
         })?;
         let pid = child.id();
@@ -308,6 +308,7 @@ impl Client {
         // stdout: JSON-RPC messages, one per line
         let p = peer.clone();
         let me = self.clone();
+        let prog = prog.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(l)) = lines.next_line().await {
@@ -320,12 +321,15 @@ impl Client {
                     Err(_) => me.keep_output(format!("[stdout] {l}")),
                 }
             }
-            let code = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-                Ok(Ok(s)) => s.code().map(|c| format!("exit code {c}")).unwrap_or_else(|| "killed".into()),
-                _ => "closed its output".into(),
+            let status = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            let why = match status {
+                // 9009: cmd.exe (the fallback for .cmd shims) didn't find the program
+                Ok(Ok(s)) if cfg!(windows) && s.code() == Some(9009) => not_found(&prog),
+                Ok(Ok(s)) => format!("the server exited ({})", s.code().map(|c| format!("exit code {c}")).unwrap_or_else(|| "killed".into())),
+                _ => "the server exited (closed its output)".into(),
             };
             p.fail_all("the MCP server exited");
-            let _ = p.events.send(Event::Closed(format!("the server exited ({code})")));
+            let _ = p.events.send(Event::Closed(why));
         });
         Ok(peer)
     }
@@ -395,6 +399,10 @@ pub async fn probe_with(conn: &crate::store::Connection, m: &McpServer, secret: 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     st
+}
+
+fn not_found(prog: &str) -> String {
+    format!("cannot start '{prog}': program not found (is it installed and on PATH?)")
 }
 
 /// Turn a `tools/call` result into (content items JSON, is_error).
