@@ -4,14 +4,40 @@ Let **Claude Code** running on a server work on other machines (your Windows or 
 WSL, a robot computer on the laptop's LAN) **without installing Claude Code on them**, and
 without ever showing the agent an IP address, user name or password.
 
-```
- Claude Code ──MCP (stdio)──> ccc-hub mcp ──unix socket──> ccc-hub serve        ← server
-                                                                ▲
-                                     WebSocket over TLS, dialled OUT by the laptop
-                                                                │
-                      laptop:  ccc   (GUI · CLI · headless) ────┘
-                                 ├─ "This computer"   → runs commands on the laptop (PowerShell / bash)
-                                 └─ SSH connections   → WSL, robot, any LAN host (nothing installed there)
+```mermaid
+flowchart TB
+    subgraph server["🖥️ Server"]
+        direction LR
+        cc["Claude Code"] -- "MCP (stdio)" --> mcp["ccc-hub mcp"]
+        mcp -- "unix socket" --> hub["ccc-hub serve"]
+    end
+
+    subgraph laptop["💻 Laptop"]
+        ccc["ccc<br/>GUI · CLI · headless"]
+        local["This computer<br/>PowerShell / bash"]
+        mcpsrv["MCP servers<br/>e.g. Blender"]
+        ccc --> local
+        ccc --> mcpsrv
+    end
+
+    subgraph lan["🌐 SSH targets (nothing installed)"]
+        direction LR
+        wsl["WSL"]
+        robot["Robot computer"]
+        other["Any LAN host"]
+    end
+
+    ccc == "WebSocket over TLS<br/>dialled OUT by the laptop" ==> hub
+    ccc -- SSH --> wsl
+    ccc -- SSH --> robot
+    ccc -- SSH --> other
+
+    classDef srv fill:#e8f0fe,stroke:#4a6fd1,color:#1a2b4c
+    classDef lap fill:#e6f4ea,stroke:#3c8c5a,color:#173a24
+    classDef tgt fill:#fef7e0,stroke:#c99a16,color:#4a3a08
+    class cc,mcp,hub srv
+    class ccc,local,mcpsrv lap
+    class wsl,robot,other tgt
 ```
 
 | Part | Runs on | What it does |
